@@ -56,6 +56,8 @@ class FakeBroker:
   known_orders: dict[int, OrderStatus] = field(default_factory=dict)
   session: bool = True
   next_perm: int = 9000
+  # Simulate ib_async reporting Cancelled while IBKR still works the order.
+  ghost_live: bool = False
 
   async def ensure_connected(self) -> None:
     """Nothing to connect."""
@@ -149,18 +151,25 @@ class FakeBroker:
     """Cancel unless filled."""
     if handle.trade.status != "Filled":
       handle.trade.status = "Cancelled"
+      if self.ghost_live:
+        handle.trade.ghost = True
 
-  async def find_order(self, perm_id: int) -> OrderStatus | None:
-    """Known orders by permId."""
+  async def find_order(self, perm_id: int | None,
+                       order_id: int | None = None) -> OrderStatus | None:
+    """Known orders by permId (or orderId = position in `placed`)."""
     if perm_id in self.known_orders:
       return self.known_orders[perm_id]
     p = next((x for x in self.placed if x.perm_id == perm_id), None)
+    if p is None and order_id and order_id <= len(self.placed):
+      p = self.placed[order_id - 1]
     if p is None:
       return None
+    if getattr(p, "ghost", False):
+      return OrderStatus("Submitted", p.filled, None)
     return OrderStatus(p.status, p.filled, p.prices[-1])
 
-  async def cancel_perm(self, perm_id: int) -> None:
+  async def cancel_order(self, perm_id: int | None, order_id: int | None) -> None:
     """Cancel a resting order unless it filled."""
     st = self.known_orders.get(perm_id)
     if st is not None and st.status != "Filled":
-      self.known_orders[perm_id] = OrderStatus("Cancelled", 0, None)
+      self.known_orders[perm_id] = OrderStatus("Cancelled", st.filled, st.avg_price)

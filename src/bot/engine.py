@@ -21,15 +21,18 @@ from src.bot.exits import (
   close_plan,
   exit_reason,
   marks,
+  short_leg_close_plan,
   stock_close_plan,
   take_profit_price,
 )
 from src.bot.store import PositionRow, Store
 from src.guard import GuardContext, KillSwitch, evaluate, halt_file_present, kill_reason
 from src.guard.models import (
+  EMERGENCY_CLOSE_REASONS,
   AccountState,
   BookState,
   CloseReason,
+  Holding,
   LiveFlags,
   MarketClock,
   OrderIntent,
@@ -42,6 +45,8 @@ NEW_YORK = ZoneInfo("America/New_York")
 TICK_SECONDS = 30
 CLOSED_POLL = dt.timedelta(minutes=5)
 TP_CANCEL_WAIT_S = 15
+TICK_TIMEOUT_S = 900  # a hung IBKR call must not stop the loop (and exits) forever
+UNKNOWN_ORDER_GRACE = dt.timedelta(days=1)
 
 @dataclass
 class Clocks:
@@ -77,6 +82,9 @@ class Engine:
     self.poll_s = 1.0
     # Positions IBKR didn't report on the last check (must be missing twice).
     self._missing: set[str] = set()
+    # Option positions in the account that aren't in the bot's book.
+    self._orphans: list[Holding] = []
+    self.now = lambda: dt.datetime.now(dt.UTC)
 
   @property
   def strategy(self) -> StrategySettings:
@@ -137,30 +145,33 @@ class Engine:
       await self._resolve_order(row)
     missing = set()
     for p in self.store.open_positions():
-      held_long = _held(account, p.long_con_id)
-      held_short = _held(account, p.short_con_id) if p.short_con_id else 0
+      held_long, held_short = _legs_held(account, p)
       if held_long == 0 and held_short == 0:
         if p.id in self._missing:
-          await self._finalize_external(p)
+          await self._book_external(p, p.quantity)
         else:
           missing.add(p.id)
           logger.warning("Position {} not reported by IBKR; checking again", p.id)
+      elif 0 < held_long < p.quantity and held_short <= held_long:
+        # Part of it was closed outside the bot (e.g. a partly filled take-profit).
+        await self._book_external(p, p.quantity - int(held_long))
     self._missing = missing
     bot_legs = {c for p in self.store.open_positions() for c in p.con_ids}
-    for h in account.holdings.values():
-      if h.sec_type == "OPT" and h.quantity and h.con_id not in bot_legs:
-        logger.error("Option {} {} {} x{} held but not in the bot's book",
-                     h.symbol, h.expiry, h.strike, h.quantity)
+    self._orphans = [h for h in account.holdings.values()
+                     if h.sec_type == "OPT" and h.quantity and h.con_id not in bot_legs]
+    for h in self._orphans:
+      logger.error("Option {} {} {} x{} held but not in the bot's book; entries "
+                   "paused until resolved", h.symbol, h.expiry, h.strike, h.quantity)
 
   async def _resolve_order(self, row: object) -> None:
-    status = None if row["perm_id"] is None else await self.broker.find_order(
-      row["perm_id"],
-    )
+    status = await self.broker.find_order(row["perm_id"], row["order_id"])
     if status is None:
-      # Never reached IBKR (or IBKR forgot it): nothing was filled by it.
-      self.store.update_order(row["id"], status="lost")
-      logger.warning("Order {} never confirmed by IBKR; marked lost", row["id"])
-      return
+      age = self.now() - dt.datetime.fromisoformat(row["created_at"])
+      if age > UNKNOWN_ORDER_GRACE:
+        # IBKR has no record of it a day later: it never reached IBKR.
+        self.store.update_order(row["id"], status="lost")
+        logger.warning("Order {} never confirmed by IBKR; marked lost", row["id"])
+      return  # keep it unresolved (and its duplicate block) until then
     if not status.terminal:
       return  # still working; check again next cycle
     self.store.update_order(
@@ -169,6 +180,14 @@ class Engine:
     )
     if row["purpose"] == "open" and status.filled > 0:
       self._adopt_open(row, status.filled, status.avg_price)
+    elif row["purpose"] == "close" and status.filled > 0 and row["position_id"]:
+      p = next((x for x in self.store.open_positions()
+                if x.id == row["position_id"]), None)
+      intent = json.loads(row["intent_json"])
+      if p is not None and intent["legs"][0]["sec_type"] == "OPT" and len(
+        intent["legs"]) == len(p.con_ids):
+        self._book_close(p, int(status.filled), status.avg_price, None,
+                         intent.get("close_reason") or "unknown")
 
   def _adopt_open(self, row: object, filled: float, avg: float | None) -> None:
     intent = json.loads(row["intent_json"])
@@ -177,6 +196,8 @@ class Engine:
     long, short = legs[0], (legs[1] if len(legs) > 1 else None)
     qty = int(filled)
     pid = f"P{row['id']}"
+    if self.store.has_position(pid):
+      return
     fee = self._one_way_fee(len(legs), qty)
     self.store.add_position(PositionRow(
       id=pid, symbol=long["symbol"], expiry=dt.date.fromisoformat(long["expiry"]),
@@ -195,21 +216,34 @@ class Engine:
     self.store.update_order(row["id"], position_id=pid)
     logger.warning("Adopted position {} from an order filled while unattended", pid)
 
-  async def _finalize_external(self, p: PositionRow) -> None:
-    status = None if p.tp_perm_id is None else await self.broker.find_order(
-      p.tp_perm_id,
-    )
-    if status is not None and status.status == "Filled":
+  async def _book_external(self, p: PositionRow, qty: int) -> None:
+    """Book `qty` of a position that was closed outside the bot's own orders."""
+    status = None
+    if p.tp_perm_id is not None or p.tp_order_id is not None:
+      status = await self.broker.find_order(p.tp_perm_id, p.tp_order_id)
+    if status is not None and status.filled > 0:
       exit_price, reason = status.avg_price, "profit_target"
+      if status.terminal:
+        self.store.set_take_profit(p.id, None, None)
     else:
       # Unknown exit: book the worst case so budget and kill switch stay safe.
       exit_price, reason = 0.0, "external_unknown"
-      logger.warning("Position {} vanished from IBKR; booking worst case", p.id)
+      logger.warning("Position {} x{} gone from IBKR; booking worst case", p.id, qty)
+    self._book_close(p, qty, exit_price, None if exit_price else 0.0, reason)
+
+  def _book_close(
+    self, p: PositionRow, qty: int, exit_price: float | None,
+    exit_fee: float | None, reason: str,
+  ) -> None:
+    """Record a (partial) close and its realised P&L."""
+    qty = min(qty, p.quantity)
     legs = 2 if p.short_con_id else 1
-    pnl = (exit_price - p.entry_price) * 100 * p.quantity - p.entry_commission - (
-      self._one_way_fee(legs, p.quantity) if exit_price else 0
-    )
-    self.store.reduce_position(p.id, p.quantity, exit_price, round(pnl, 2), reason)
+    fee = self._one_way_fee(legs, qty) if exit_fee is None else exit_fee
+    pnl = ((exit_price or 0.0) - p.entry_price) * 100 * qty - (
+      p.entry_commission * qty / p.quantity) - fee
+    self.store.reduce_position(p.id, qty, exit_price, round(pnl, 2), reason)
+    logger.info("Booked {} x{} ({}) at {}: P&L ${:.2f}", p.id, qty, reason,
+                exit_price, pnl)
 
   # ------------------------------------------------------------------ exits
 
@@ -227,48 +261,103 @@ class Engine:
     quotes = await self.broker.leg_quotes(con_ids) if con_ids else {}
 
     for h in stocks:  # assignment: flatten the stock first
-      logger.warning("Stock {} x{} in account (assignment?)", h.symbol, h.quantity)
-      plan = stock_close_plan(h.con_id, h.symbol, h.quantity, quotes.get(h.con_id))
-      if plan is None:
-        logger.error("Cannot price stock {} to close it", h.symbol)
-        continue
-      await self._send_close(plan.intent, plan.start_price, plan.step, None,
-                             account, clock)
+      await self._close_stock(h, quotes, positions, account, clock)
     if stocks:
       account = await self.broker.account_state()
 
     capital = await self.capital_usd()
     if capital is not None and not self.kill.tripped:
       equity = capital + self.store.realized_total() + sum(
-        _unrealized(p, quotes) for p in positions
+        _unrealized(p, quotes, account) for p in positions
       )
       if reason := kill_reason(equity, capital, self.store.consecutive_losses(),
                                self.strategy):
         self.kill.trip(reason)
 
-    for p in self.store.open_positions():
-      if p.id in self._missing:
+    for booked in self.store.open_positions():
+      if booked.id in self._missing:
         continue  # not reported by IBKR right now; reconcile decides next time
+      held_long, held_short = _legs_held(account, booked)
+      if held_short > held_long:
+        # More sold than bought legs (bought leg gone): buy the excess back now.
+        await self._buy_back_short(booked, int(held_short - held_long), quotes,
+                                   account, clock)
+        continue
+      p = replace(booked, quantity=min(booked.quantity, int(held_long)))
       _, worst = marks(p, quotes)
-      short_gone = p.short_con_id and _held(account, p.short_con_id) == 0
       reason: CloseReason | None
       if self.kill.tripped:
         reason = "kill_switch"
-      elif short_gone:
+      elif p.short_con_id and held_short == 0:
         reason = "assignment"
       else:
         reason = exit_reason(p, worst, clock.today, self.strategy)
       if reason is not None:
         await self._close_position(p, reason, quotes, account, clock)
-      elif p.tp_perm_id is None and p.opened_on < clock.today:
+      elif (p.structure == "debit_vertical" and p.tp_perm_id is None
+            and p.tp_order_id is None and p.opened_on < clock.today):
         await self._place_take_profit(p, quotes, account, clock)
+
+  async def _close_stock(
+    self, h: Holding, quotes: dict[int, LegQuote], positions: list[PositionRow],
+    account: AccountState, clock: MarketClock,
+  ) -> None:
+    """Flatten stock left by an assignment and book its P&L on the position."""
+    logger.warning("Stock {} x{} in account (assignment?)", h.symbol, h.quantity)
+    plan = stock_close_plan(h.con_id, h.symbol, h.quantity, quotes.get(h.con_id))
+    if plan is None:
+      logger.error("Cannot price stock {} to close it", h.symbol)
+      return
+    related = next((p for p in positions if p.symbol == h.symbol and p.short_con_id
+                    and _held(account, p.short_con_id) == 0), None) or next(
+      (p for p in positions if p.symbol == h.symbol), None)
+    result = await self._send_close(plan.intent, plan.start_price, plan.step,
+                                    related.id if related else None, account, clock)
+    if result is None or result.filled <= 0 or result.avg_price is None:
+      return
+    if h.avg_cost is None or related is None:
+      logger.error("Stock {} closed but its P&L can't be attributed", h.symbol)
+      return
+    sign = 1 if h.quantity > 0 else -1  # long stock: profit if sold above cost
+    pnl = sign * (result.avg_price - h.avg_cost) * result.filled - (
+      result.commission or 1.0)
+    self.store.add_realized(related.id, round(pnl, 2))
+    logger.info("Stock {} closed at {}: P&L ${:.2f} booked on {}", h.symbol,
+                result.avg_price, pnl, related.id)
+
+  async def _buy_back_short(
+    self, p: PositionRow, qty: int, quotes: dict[int, LegQuote],
+    account: AccountState, clock: MarketClock,
+  ) -> None:
+    logger.error("Position {}: {} sold leg(s) without the bought leg; buying back",
+                 p.id, qty)
+    if (p.tp_perm_id is not None or p.tp_order_id is not None) and not (
+      await self._cancel_take_profit(p, emergency=True)
+    ):
+      return
+    plan = short_leg_close_plan(p, qty, quotes.get(p.short_con_id))
+    result = await self._send_close(plan.intent, plan.start_price, plan.step, p.id,
+                                    account, clock)
+    if result is not None and result.filled > 0 and result.avg_price is not None:
+      cost = result.avg_price * 100 * result.filled + (result.commission or 1.0)
+      self.store.add_realized(p.id, -round(cost, 2))
 
   async def _close_position(
     self, p: PositionRow, reason: CloseReason, quotes: dict[int, LegQuote],
     account: AccountState, clock: MarketClock,
   ) -> None:
-    if p.tp_perm_id is not None and not await self._cancel_take_profit(p):
+    if p.quantity <= 0:
       return
+    emergency = reason in EMERGENCY_CLOSE_REASONS
+    if (p.tp_perm_id is not None or p.tp_order_id is not None) and not (
+      await self._cancel_take_profit(p, emergency=emergency)
+    ):
+      return
+    # Re-read: cancelling the take-profit may have booked part of it.
+    current = next((x for x in self.store.open_positions() if x.id == p.id), None)
+    if current is None:
+      return
+    p = replace(current, quantity=min(p.quantity, current.quantity))
     if p.short_con_id and _held(account, p.short_con_id) == 0:
       # Short leg already gone (assigned): sell only the long leg.
       p = replace(p, short_con_id=None, short_strike=None)
@@ -278,15 +367,10 @@ class Engine:
       return
     result = await self._send_close(plan.intent, plan.start_price, plan.step, p.id,
                                     account, clock)
-    if result is not None and result.filled > 0:
-      legs = len(plan.intent.legs)
-      qty = int(result.filled)
-      exit_fee = result.commission or self._one_way_fee(legs, qty)
-      share = qty / p.quantity
-      pnl = ((result.avg_price or 0) - p.entry_price) * 100 * qty - (
-        p.entry_commission * share) - exit_fee
-      self.store.reduce_position(p.id, qty, result.avg_price, round(pnl, 2), reason)
-      logger.info("Closed {} x{} ({}): P&L ${:.2f}", p.id, qty, reason, pnl)
+    if result is not None and result.filled > 0 and result.status != "unknown":
+      book = next(x for x in self.store.open_positions() if x.id == p.id)
+      self._book_close(book, int(result.filled), result.avg_price, result.commission,
+                       reason)
 
   async def _send_close(  # noqa: PLR0913
     self, intent: OrderIntent, start: float, step: float, position_id: str | None,
@@ -304,23 +388,31 @@ class Engine:
                          step=step, position_id=position_id,
                          interval_s=self.reprice_interval_s, poll_s=self.poll_s)
 
-  async def _cancel_take_profit(self, p: PositionRow) -> bool:
-    """Cancel the resting take-profit; False if it filled (position is done)."""
-    await self.broker.cancel_perm(p.tp_perm_id)
+  async def _cancel_take_profit(self, p: PositionRow, *, emergency: bool) -> bool:
+    """Cancel the resting take-profit and book any fills.
+
+    Returns True when the rest of the position may be closed. An unconfirmed
+    cancel blocks normal closes (a stray take-profit filling later would sell
+    from a flat book); emergencies go ahead anyway, loudly.
+    """
+    await self.broker.cancel_order(p.tp_perm_id, p.tp_order_id)
     status = None
     for _ in range(TP_CANCEL_WAIT_S):
-      status = await self.broker.find_order(p.tp_perm_id)
-      if status is None or status.terminal:
+      status = await self.broker.find_order(p.tp_perm_id, p.tp_order_id)
+      if status is not None and status.terminal:
         break
       await asyncio.sleep(self.poll_s)
-    if status is not None and status.status == "Filled":
-      await self._finalize_external(p)
-      return False
-    if status is not None and not status.terminal:
-      logger.error("Take-profit for {} won't cancel; not closing yet", p.id)
-      return False
-    self.store.set_take_profit(p.id, None, None)
-    return True
+    if status is not None and status.filled > 0:
+      self._book_close(p, int(status.filled), status.avg_price, None, "profit_target")
+    if status is not None and status.terminal:
+      self.store.set_take_profit(p.id, None, None)
+      return status.status != "Filled"
+    if emergency:
+      logger.error("Take-profit for {} not confirmed cancelled; closing anyway "
+                   "because this is an emergency", p.id)
+      return True
+    logger.error("Take-profit for {} not confirmed cancelled; not closing yet", p.id)
+    return False
 
   async def _place_take_profit(
     self, p: PositionRow, quotes: dict[int, LegQuote], account: AccountState,
@@ -365,6 +457,8 @@ class Engine:
       return "max open positions"
     if self.store.trades_opened_on(clock.today) >= r.max_trades_per_day:
       return "max trades today"
+    if self._orphans:
+      return "option positions held that aren't in the bot's book"
     if self.claude is None:
       return "no ANTHROPIC_API_KEY"
     return None
@@ -417,6 +511,8 @@ class Engine:
       v.underlying, clock.today, self.strategy, right=right,
       target_dte=target_dte(self.strategy),
     )
+    # Measure quote ages (and the entry window) from now, after the quotes arrived.
+    clock = replace(clock, now=self.now())
     plan, why = plan_entry(v.direction, v.structure, quotes, clock.today,
                            clock.now, self.strategy, capital)
     if plan is None:
@@ -438,7 +534,7 @@ class Engine:
                            start_price=plan.start_price, step=0.01,
                            fingerprint=fingerprint(classified),
                            interval_s=self.reprice_interval_s, poll_s=self.poll_s)
-    if result.filled > 0:
+    if result.filled > 0 and result.status in ("filled", "partial"):
       self._record_fill(plan, result, clock)
     return result.status
 
@@ -494,7 +590,7 @@ class Engine:
     logger.info("Bot starting: {}", mode)
     while True:
       try:
-        wait = await self.tick()
+        wait = await asyncio.wait_for(self.tick(), TICK_TIMEOUT_S)
       except Exception:
         logger.exception("Pass failed; retrying shortly")
         wait = dt.timedelta(seconds=60)
@@ -509,7 +605,19 @@ def _held(account: AccountState, con_id: int | None) -> float:
   h = account.holdings.get(con_id)
   return 0 if h is None else h.quantity
 
-def _unrealized(p: PositionRow, quotes: dict[int, LegQuote]) -> float:
+def _legs_held(account: AccountState, p: PositionRow) -> tuple[float, float]:
+  """(bought contracts held, sold contracts held) for a position's legs."""
+  long = max(_held(account, p.long_con_id), 0)
+  short = -min(_held(account, p.short_con_id), 0) if p.short_con_id else 0
+  return long, short
+
+def _unrealized(
+  p: PositionRow, quotes: dict[int, LegQuote], account: AccountState,
+) -> float:
+  held_long, held_short = _legs_held(account, p)
+  if p.short_con_id and held_short == 0:
+    p = replace(p, short_con_id=None, short_strike=None)  # assigned: long leg only
+  p = replace(p, quantity=min(p.quantity, int(held_long)) or p.quantity)
   _, worst = marks(p, quotes)
   if worst is None:
     return 0.0  # unquoted: assume unchanged rather than trip on missing data

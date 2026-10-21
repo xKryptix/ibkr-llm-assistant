@@ -169,3 +169,38 @@ def test_summarize_market() -> None:
   assert out["iv_rank_1y_pct"] == 50
   assert out["today_30min_closes"] == [134.0, 135.0]
   assert "realized_vol_20d_pct" in out
+
+# ------------------------------------------------------- review regressions
+
+def test_profit_target_is_above_entry() -> None:
+  """Paid 0.85 for a $1 spread: 80% of width would be a loss, so aim higher."""
+  from src.bot.exits import profit_target
+  p = position(entry_price=0.85)
+  assert profit_target(p, S) > 0.85
+  assert exit_reason(p, 0.80, TODAY, S) is None
+  assert take_profit_price(p, S) > 0.85
+
+def test_emergency_close_without_quotes() -> None:
+  """No quote at 2 DTE: still close, at the minimum price."""
+  plan = close_plan(position(), {}, "expiry")
+  assert (plan.start_price, plan.intent.limit_price) == (0.01, 0.01)
+
+def test_short_leg_buyback_plan() -> None:
+  """Buy the lone sold leg back, paying up to 15c over the ask."""
+  from src.bot.exits import short_leg_close_plan
+  plan = short_leg_close_plan(position(), 1, LegQuote(1603, 3.45, 3.53, NOW))
+  i = plan.intent
+  assert (i.action, i.legs[0].action, i.legs[0].con_id) == ("BUY", "BUY", 1603)
+  assert (plan.start_price, i.limit_price) == (3.53, 3.68)
+
+async def test_brain_uses_last_text_block_after_fallback() -> None:
+  """The declining model's text comes first; the answer is the last block."""
+  client = client_returning("ignored")
+  client.beta.messages.response.content = [
+    SimpleNamespace(type="text", text="I can't help with that."),
+    SimpleNamespace(type="text", text=(
+      '{"underlying": "QQQ", "direction": "bearish", "structure": "long_option",'
+      ' "confidence": 0.8, "rationale": "x"}')),
+  ]
+  result = await brain.ask(client, "m", [], {})
+  assert result.view.underlying == "QQQ"

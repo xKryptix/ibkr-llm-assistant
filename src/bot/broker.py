@@ -30,6 +30,10 @@ from src.utilities.strategy_settings import StrategySettings
 NEW_YORK = util.ZoneInfo("America/New_York")
 UNSET_DOUBLE_LIMIT = 1e300
 TERMINAL = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"})
+# The bot must always reconnect with the same client ID, or it can neither see
+# nor cancel the orders (e.g. resting take-profits) it placed earlier.
+DEFAULT_BOT_CLIENT_ID = 11
+WHATIF_TIMEOUT_S = 30
 
 @dataclass(frozen=True)
 class LegQuote:
@@ -114,11 +118,16 @@ class Broker(Protocol):
   async def cancel(self, handle: OrderHandle) -> None:
     """Request cancellation."""
 
-  async def find_order(self, perm_id: int) -> OrderStatus | None:
-    """Status of an order by permanent ID (open or completed), if IBKR knows it."""
+  async def find_order(
+    self, perm_id: int | None, order_id: int | None = None,
+  ) -> OrderStatus | None:
+    """Status of an order (open or completed), or None if IBKR doesn't report it.
 
-  async def cancel_perm(self, perm_id: int) -> None:
-    """Cancel an open order by permanent ID."""
+    None means "unconfirmed", never "cancelled".
+    """
+
+  async def cancel_order(self, perm_id: int | None, order_id: int | None) -> None:
+    """Cancel an open order by permanent ID (or this client's order ID)."""
 
 def _num(x: float | None) -> float:
   return math.nan if x is None or x == -1 else float(x)
@@ -140,10 +149,14 @@ class IBBroker(SurveyClient):
     """
     super().__init__(readonly=False)
     self.dry_run = dry_run
+    self.client_id = self.config.ib_client_id or DEFAULT_BOT_CLIENT_ID
     self._contracts: dict[int, Contract] = {}
     self._clock_cache: (
       tuple[dt.date, dt.datetime | None, dt.datetime | None] | None
     ) = None
+
+  def _client_id(self) -> int:
+    return self.client_id
 
   async def ensure_connected(self) -> None:
     """Connect, or reconnect after a Gateway restart; use live market data."""
@@ -182,6 +195,7 @@ class IBBroker(SurveyClient):
         con_id=c.conId, symbol=c.symbol, sec_type=c.secType,
         quantity=float(p.position), expiry=_expiry(c),
         right=c.right or None, strike=c.strike or None,
+        avg_cost=float(p.avgCost) / (float(c.multiplier) if c.multiplier else 1.0),
       )
     if math.isnan(usd_cash):
       # A brand-new account may not report a USD line until it holds USD.
@@ -311,7 +325,8 @@ class IBBroker(SurveyClient):
   async def whatif(self, intent: OrderIntent) -> WhatIf:
     """IBKR order preview at the intent's limit price."""
     contract, order = await self._order_parts(intent, intent.limit_price)
-    state = await self.ib.whatIfOrderAsync(contract, order)
+    state = await asyncio.wait_for(self.ib.whatIfOrderAsync(contract, order),
+                                   WHATIF_TIMEOUT_S)
     commission = state.commission
     if commission is None or not math.isfinite(commission) or (
       commission > UNSET_DOUBLE_LIMIT
@@ -357,26 +372,37 @@ class IBBroker(SurveyClient):
     """Request cancellation."""
     self.ib.cancelOrder(handle.trade.order)
 
-  async def find_order(self, perm_id: int) -> OrderStatus | None:
-    """Look up an order by permanent ID among open, session and completed orders."""
-    for t in self.ib.trades():
-      if t.order.permId == perm_id:
+  def _matches(self, t: Trade, perm_id: int | None, order_id: int | None) -> bool:
+    if perm_id and t.order.permId == perm_id:
+      return True
+    return bool(order_id) and t.order.orderId == order_id and (
+      t.order.clientId == self.client_id
+    )
+
+  async def find_order(
+    self, perm_id: int | None, order_id: int | None = None,
+  ) -> OrderStatus | None:
+    """Look an order up among open (all clients) and completed orders."""
+    open_trades = await self.ib.reqAllOpenOrdersAsync()
+    for t in [*self.ib.trades(), *open_trades]:
+      if self._matches(t, perm_id, order_id):
         return OrderStatus(t.orderStatus.status, float(t.orderStatus.filled),
                            t.orderStatus.avgFillPrice or t.order.lmtPrice)
     for t in await self.ib.reqCompletedOrdersAsync(apiOnly=True):
-      if t.order.permId == perm_id:
+      if self._matches(t, perm_id, order_id):
         filled = t.order.filledQuantity
         filled = float(filled) if filled and filled < UNSET_DOUBLE_LIMIT else 0.0
         return OrderStatus(t.orderStatus.status, filled, t.order.lmtPrice)
     return None
 
-  async def cancel_perm(self, perm_id: int) -> None:
-    """Cancel an open order by permanent ID."""
-    for t in self.ib.openTrades():
-      if t.order.permId == perm_id:
+  async def cancel_order(self, perm_id: int | None, order_id: int | None) -> None:
+    """Cancel an open order placed by this client."""
+    for t in [*self.ib.openTrades(), *await self.ib.reqAllOpenOrdersAsync()]:
+      if self._matches(t, perm_id, order_id):
         self.ib.cancelOrder(t.order)
         return
-    logger.warning("No open order with permId {} to cancel", perm_id)
+    logger.warning("No open order (permId {}, orderId {}) to cancel", perm_id,
+                   order_id)
 
 def summarize_market(
   symbol: str,

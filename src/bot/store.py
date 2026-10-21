@@ -131,20 +131,37 @@ class Store:
     """Close `quantity` of a position; closes it fully when nothing is left."""
     p = next(x for x in self.open_positions() if x.id == position_id)
     left = p.quantity - quantity
+    keep = left / p.quantity if left > 0 else 1.0  # history keeps the last size
     with self.conn:
       self.conn.execute(
-        "UPDATE positions SET quantity = ?, max_loss_usd = ?,"
+        "UPDATE positions SET quantity = ?, max_loss_usd = ?, entry_commission = ?,"
         " realized_pnl_usd = realized_pnl_usd + ?, exit_price = ?,"
         " exit_reason = ?, status = ?, closed_at = ? WHERE id = ?",
         (
-          max(left, 0) if left > 0 else p.quantity,
-          round(p.max_loss_usd * left / p.quantity, 2) if left > 0 else p.max_loss_usd,
+          left if left > 0 else p.quantity,
+          round(p.max_loss_usd * keep, 2),
+          round(p.entry_commission * keep, 2),
           realized_pnl_usd, exit_price, reason,
           "open" if left > 0 else "closed",
           None if left > 0 else _now(),
           position_id,
         ),
       )
+
+  def add_realized(self, position_id: str, pnl_usd: float) -> None:
+    """Add P&L from something tied to a position (e.g. stock after assignment)."""
+    with self.conn:
+      self.conn.execute(
+        "UPDATE positions SET realized_pnl_usd = realized_pnl_usd + ? WHERE id = ?",
+        (pnl_usd, position_id),
+      )
+
+  def has_position(self, position_id: str) -> bool:
+    """Whether a position with this ID was ever recorded."""
+    row = self.conn.execute(
+      "SELECT 1 FROM positions WHERE id = ?", (position_id,),
+    ).fetchone()
+    return row is not None
 
   def realized_total(self) -> float:
     """Realised P&L over all positions (USD)."""

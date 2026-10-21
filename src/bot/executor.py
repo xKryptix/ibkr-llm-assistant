@@ -47,6 +47,31 @@ async def _wait(broker: Broker, handle: OrderHandle, seconds: float,
     status = await broker.status(handle)
   return status
 
+async def _confirm_done(
+  broker: Broker, handle: OrderHandle, status: OrderStatus, poll_s: float,
+) -> OrderStatus:
+  """Double-check a 'cancelled' order with IBKR.
+
+  ib_async marks an order Cancelled on any order error, even when IBKR only
+  rejected a price change and the order is still working.
+  """
+  confirm = await broker.find_order(handle.perm_id, handle.order_id)
+  if confirm is not None and not confirm.terminal:
+    logger.warning("Order {} still working at IBKR; cancelling again", handle.order_id)
+    await broker.cancel_order(handle.perm_id, handle.order_id)
+    for _ in range(15):
+      await asyncio.sleep(poll_s)
+      confirm = await broker.find_order(handle.perm_id, handle.order_id)
+      if confirm is None or confirm.terminal:
+        break
+    if confirm is not None and not confirm.terminal:
+      return OrderStatus("Unknown", max(status.filled, confirm.filled),
+                         confirm.avg_price or status.avg_price, status.commission)
+  if confirm is not None and confirm.filled > status.filled:
+    return OrderStatus(confirm.status, confirm.filled,
+                       confirm.avg_price or status.avg_price, status.commission)
+  return status
+
 async def execute(  # noqa: C901, PLR0913
   broker: Broker,
   store: Store,
@@ -91,6 +116,8 @@ async def execute(  # noqa: C901, PLR0913
     if not status.terminal:
       await broker.cancel(handle)
       status = await _wait(broker, handle, 15.0, poll_s)
+    if status.terminal and status.filled < intent.quantity:
+      status = await _confirm_done(broker, handle, status, poll_s)
   except Exception:
     logger.exception("Lost track of order {}", handle.order_id)
     store.update_order(row, status="unknown", perm_id=handle.perm_id)

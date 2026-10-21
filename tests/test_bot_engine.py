@@ -29,6 +29,7 @@ def make_engine(tmp_path: Path, broker: FakeBroker) -> Engine:
   )
   engine.reprice_interval_s = 0
   engine.poll_s = 0
+  engine.now = lambda: broker.now
   return engine
 
 @pytest.fixture
@@ -308,3 +309,144 @@ async def test_missed_fill_is_adopted(tmp_path: Path, claude_says: list) -> None
   await engine.exit_cycle()
   [p] = engine.store.open_positions()
   assert (p.long_con_id, p.short_con_id, p.quantity) == (1602, 1603, 1)
+
+# ------------------------------------------------------- review regressions
+
+async def test_quote_age_measured_after_quotes_arrive(tmp_path: Path,
+                                                      claude_says: list) -> None:
+  """Real quotes are stamped after the cycle started; they must not look stale."""
+  claude_says[0](BULL_SPREAD)
+  later = NOW + dt.timedelta(seconds=5)
+  broker = FakeBroker()
+  broker.quotes = [__import__("dataclasses").replace(q, quoted_at=later)
+                   for q in broker.quotes]
+  engine = make_engine(tmp_path, broker)
+  engine.now = lambda: later + dt.timedelta(seconds=3)
+  await engine.entry_cycle()
+  assert len(broker.placed) == 1
+
+async def test_no_resting_take_profit_for_single_options(tmp_path: Path) -> None:
+  """A stray take-profit on a single option could sell it naked, so none is placed."""
+  broker = FakeBroker()
+  engine = make_engine(tmp_path, broker)
+  broker.holdings[1604] = Holding(1604, "SPY", "OPT", 1, EXPIRY, "C", 604.0)
+  engine.store.add_position(PositionRow(
+    id="L1", symbol="SPY", expiry=EXPIRY, right="C", structure="long_option",
+    quantity=1, long_con_id=1604, long_strike=604.0, short_con_id=None,
+    short_strike=None, entry_price=3.0, entry_commission=1.0, max_loss_usd=302.0,
+    opened_at=NOW.isoformat(), opened_on=TODAY - dt.timedelta(days=1),
+    tp_order_id=None, tp_perm_id=None, realized_pnl_usd=0.0,
+  ))
+  await engine.exit_cycle()
+  assert broker.placed == []
+
+@pytest.mark.parametrize(("expiry", "closes"), [
+  (EXPIRY, False),                              # stop: wait for confirmation
+  (TODAY + dt.timedelta(days=2), True),         # expiry: close anyway
+])
+async def test_unconfirmed_take_profit_cancel(tmp_path: Path, expiry: dt.date,
+                                              closes: bool) -> None:  # noqa: FBT001
+  """If IBKR can't confirm the take-profit is gone, only emergencies proceed."""
+  broker = FakeBroker()
+  engine = make_engine(tmp_path, broker)
+  held_spread(broker)
+  add_spread_position(engine, expiry=expiry)
+  engine.store.set_take_profit("P1", 77, 777)  # unknown to the broker
+  quote(broker, 1602, 3.00, 3.10)
+  quote(broker, 1603, 2.80, 2.85)
+  await engine.exit_cycle()
+  assert bool(broker.placed) is closes
+
+async def test_partly_filled_take_profit_is_booked_then_rest_closed(tmp_path: Path) -> None:
+  """1 of 2 filled at the take-profit: book it, then close the other 1."""
+  broker = FakeBroker()
+  engine = make_engine(tmp_path, broker)
+  held_spread(broker)
+  broker.holdings[1602] = Holding(1602, "SPY", "OPT", 2, EXPIRY, "C", 602.0)
+  broker.holdings[1603] = Holding(1603, "SPY", "OPT", -2, EXPIRY, "C", 603.0)
+  add_spread_position(engine)
+  with engine.store.conn:
+    engine.store.conn.execute("UPDATE positions SET quantity = 2")
+  engine.store.set_take_profit("P1", 7, 555)
+  broker.known_orders[555] = OrderStatus("Submitted", 1, 0.80)
+  quote(broker, 1602, 3.00, 3.10)
+  quote(broker, 1603, 2.80, 2.85)
+  await engine.exit_cycle()
+  [order] = broker.placed
+  assert order.intent.quantity == 1
+  row = engine.store.conn.execute("SELECT status, realized_pnl_usd FROM positions").fetchone()
+  assert row["status"] == "closed"
+
+async def test_recorded_size_synced_to_ibkr(tmp_path: Path) -> None:
+  """Book says 2, IBKR holds 1: book the missing one, close what's held."""
+  broker = FakeBroker()
+  engine = make_engine(tmp_path, broker)
+  held_spread(broker)
+  add_spread_position(engine, expiry=TODAY + dt.timedelta(days=2))
+  with engine.store.conn:
+    engine.store.conn.execute("UPDATE positions SET quantity = 2")
+  await engine.exit_cycle()
+  [order] = broker.placed
+  assert order.intent.quantity == 1
+  assert engine.store.realized_total() < -40
+
+async def test_lone_short_leg_is_bought_back(tmp_path: Path) -> None:
+  """Bought leg gone, sold leg still held: buy it back at once."""
+  broker = FakeBroker()
+  engine = make_engine(tmp_path, broker)
+  broker.holdings[1603] = Holding(1603, "SPY", "OPT", -1, EXPIRY, "C", 603.0)
+  add_spread_position(engine)
+  await engine.exit_cycle()
+  [order] = broker.placed
+  assert [leg.con_id for leg in order.intent.legs] == [1603]
+  assert order.intent.action == "BUY"
+  assert 1603 not in broker.holdings
+
+async def test_assignment_stock_pnl_is_booked(tmp_path: Path) -> None:
+  """The stock buy-back's P&L lands on the position."""
+  broker = FakeBroker()
+  engine = make_engine(tmp_path, broker)
+  broker.holdings[1602] = Holding(1602, "SPY", "OPT", 1, EXPIRY, "C", 602.0)
+  broker.holdings[756733] = Holding(756733, "SPY", "STK", -100, avg_cost=603.0)
+  quote(broker, 756733, 604.0, 604.1)
+  add_spread_position(engine)
+  await engine.exit_cycle()
+  row = engine.store.conn.execute(
+    "SELECT position_id FROM orders WHERE intent_json LIKE '%STK%'").fetchone()
+  assert row["position_id"] == "P1"
+  # Stock: bought back 1.10 above the 603 assignment price = -110 - 1.30 fee.
+  # Long call sold at 3.85 against 0.44 paid: +341 - 1.30 - 1.30 fees.
+  assert engine.store.realized_total() == pytest.approx(-111.30 + 338.40)
+  assert not engine.kill.tripped  # the assigned spread is valued as long call only
+
+async def test_ghost_cancel_is_not_trusted(tmp_path: Path, claude_says: list) -> None:
+  """ib_async says Cancelled but IBKR still works it: unknown, still blocking."""
+  claude_says[0](BULL_SPREAD)
+  broker = FakeBroker(fill_on=None, ghost_live=True)
+  engine = make_engine(tmp_path, broker)
+  await engine.entry_cycle()
+  row = engine.store.conn.execute("SELECT status FROM orders").fetchone()
+  assert row["status"] == "unknown"
+  assert engine.store.unresolved_open_fingerprints()
+
+async def test_unconfirmed_order_keeps_blocking(tmp_path: Path, claude_says: list) -> None:
+  """An order IBKR can't find yet stays unresolved (not 'lost') for a day."""
+  claude_says[0](BULL_SPREAD)
+  broker = FakeBroker(fill_on=None)
+  engine = make_engine(tmp_path, broker)
+  await engine.entry_cycle()
+  engine.store.update_order(1, status="unknown", perm_id=None, order_id=None)
+  broker.placed.clear()
+  await engine.exit_cycle()
+  row = engine.store.conn.execute("SELECT status FROM orders").fetchone()
+  assert row["status"] == "unknown"
+
+async def test_unbooked_options_pause_entries(tmp_path: Path, claude_says: list) -> None:
+  """Options in the account that the bot doesn't know about: no new entries."""
+  claude_says[0](BULL_SPREAD)
+  broker = FakeBroker()
+  held_spread(broker)
+  engine = make_engine(tmp_path, broker)
+  await engine.exit_cycle()
+  await engine.entry_cycle()
+  assert broker.placed == []

@@ -112,7 +112,8 @@ async def ask(
     return BrainResult(None, f"api error: {type(e).__name__}: {e}", model)
   if response.stop_reason != "end_turn":
     return BrainResult(None, f"stop_reason {response.stop_reason}", response.model)
-  text = next((b.text for b in response.content if b.type == "text"), None)
+  # After a server-side fallback the last text block is the model that answered.
+  text = next((b.text for b in reversed(response.content) if b.type == "text"), None)
   if text is None:
     return BrainResult(None, "no text block", response.model)
   try:

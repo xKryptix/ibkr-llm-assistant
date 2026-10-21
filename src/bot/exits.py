@@ -44,6 +44,17 @@ def trading_days_held(p: PositionRow, today: dt.date) -> int:
   """Weekdays from the opening day to today."""
   return int(np.busday_count(p.opened_on, today))
 
+def profit_target(p: PositionRow, settings: StrategySettings) -> float:
+  """Value per unit at which to take profit; always above the entry price."""
+  x = settings.exits
+  if p.width is None:
+    return p.entry_price * x.long_option_profit_target_pct / 100
+  target = p.width * x.vertical_profit_target_pct_of_width / 100
+  if target <= p.entry_price + TICK:
+    # Paid close to the width: aim for halfway to the maximum instead.
+    target = p.entry_price + (p.width - p.entry_price) / 2
+  return min(target, p.width - TICK)
+
 def exit_reason(
   p: PositionRow, value: float | None, today: dt.date, settings: StrategySettings,
 ) -> CloseReason | None:
@@ -54,23 +65,15 @@ def exit_reason(
     x = settings.exits
     if value <= p.entry_price * x.stop_loss_pct / 100:
       return "stop"
-    if p.width is None:
-      target = p.entry_price * x.long_option_profit_target_pct / 100
-    else:
-      target = p.width * x.vertical_profit_target_pct_of_width / 100
-    if value >= target:
+    if value >= profit_target(p, settings) and value > p.entry_price:
       return "profit_target"
   if trading_days_held(p, today) >= settings.exits.max_hold_days:
     return "time_stop"
   return None
 
 def take_profit_price(p: PositionRow, settings: StrategySettings) -> float:
-  """Price for the resting take-profit order."""
-  x = settings.exits
-  if p.width is None:
-    return ticks(p.entry_price * x.long_option_profit_target_pct / 100)
-  return ticks(min(p.width * x.vertical_profit_target_pct_of_width / 100,
-                   p.width - TICK))
+  """Price for the resting take-profit order (spreads only)."""
+  return max(ticks(profit_target(p, settings)), ticks(p.entry_price + TICK))
 
 def position_legs(p: PositionRow, quotes: dict[int, LegQuote]) -> tuple[Leg, ...]:
   """Return the position's legs as they were bought, with current quotes."""
@@ -99,7 +102,14 @@ def close_plan(
                          tif=tif, close_reason=reason)
     return ClosePlan(intent, price, 0.0)
   if mid is None:
-    return None
+    if reason not in EMERGENCY_CLOSE_REASONS:
+      return None
+    # No usable quote but it must go (expiry/assignment/kill switch): offer at
+    # the minimum price, which fills at whatever bid there is.
+    intent = OrderIntent(purpose="close", legs=legs, action="SELL",
+                         quantity=p.quantity, order_type="LMT", limit_price=TICK,
+                         tif=tif, close_reason=reason)
+    return ClosePlan(intent, TICK, TICK)
   if reason in EMERGENCY_CLOSE_REASONS:
     start = max(ticks(worst), TICK)
     floor = max(ticks(worst - LADDER_STEPS * EMERGENCY_STEP), TICK)
@@ -113,6 +123,25 @@ def close_plan(
                        quantity=p.quantity, order_type="LMT", limit_price=floor,
                        tif=tif, close_reason=reason)
   return ClosePlan(intent, start, step)
+
+def short_leg_close_plan(
+  p: PositionRow, quantity: int, quote: LegQuote | None,
+) -> ClosePlan | None:
+  """Buy back a sold leg whose bought leg is gone (never leave it naked)."""
+  if p.short_con_id is None or quantity <= 0:
+    return None
+  ask = None if quote is None or not _finite(quote.ask) else quote.ask
+  start = max(ticks(ask), TICK) if ask else TICK
+  # Pay up to 3 x 5c above the ask; with no quote, up to the full spread width.
+  worst = ticks(start + LADDER_STEPS * EMERGENCY_STEP) if ask else ticks(
+    p.width or 1.0)
+  leg = Leg(con_id=p.short_con_id, symbol=p.symbol, sec_type="OPT", action="BUY",
+            expiry=p.expiry, right=p.right, strike=p.short_strike,
+            bid=None if quote is None else quote.bid, ask=ask)
+  intent = OrderIntent(purpose="close", legs=(leg,), action="BUY",
+                       quantity=quantity, order_type="LMT", limit_price=worst,
+                       tif="DAY", close_reason="assignment")
+  return ClosePlan(intent, start, EMERGENCY_STEP)
 
 def stock_close_plan(
   con_id: int, symbol: str, shares: float, quote: LegQuote | None,

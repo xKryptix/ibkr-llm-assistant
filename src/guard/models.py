@@ -71,6 +71,7 @@ class Holding:
   expiry: dt.date | None = None
   right: Right | None = None
   strike: float | None = None
+  avg_cost: float | None = None
 
 @dataclass(frozen=True)
 class AccountState:
