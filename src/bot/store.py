@@ -238,6 +238,83 @@ class Store:
       " AND dry_run = 0",
     ).fetchall()
 
+  # ------------------------------------------------------------------ fills
+
+  def record_fill(  # noqa: PLR0913
+    self, *, position_id: str | None, kind: str, description: str,
+    quantity: float, price: float | None, multiplier: int, commission_usd: float,
+    cash_usd: float, at: str | None = None,
+  ) -> None:
+    """Journal money moving: cash_usd < 0 paid, > 0 received (after commission)."""
+    with self.conn:
+      self.conn.execute(
+        "INSERT INTO fills (at, position_id, kind, description, quantity, price,"
+        " multiplier, commission_usd, cash_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (at or _now(), position_id, kind, description, quantity, price, multiplier,
+         round(commission_usd, 2), round(cash_usd, 2)),
+      )
+
+  def fills(self) -> list[sqlite3.Row]:
+    """Every fill, oldest first."""
+    return self.conn.execute("SELECT * FROM fills ORDER BY at, id").fetchall()
+
+  def closed_positions(self) -> list[sqlite3.Row]:
+    """Return closed positions, oldest close first."""
+    return self.conn.execute(
+      "SELECT * FROM positions WHERE status = 'closed' ORDER BY closed_at, rowid",
+    ).fetchall()
+
+  # ----------------------------------------------------------------- equity
+
+  def record_equity(
+    self, day: dt.date, capital: float, realized: float, unrealized: float,
+  ) -> None:
+    """Store (or replace) the day's closing equity."""
+    with self.conn:
+      self.conn.execute(
+        "INSERT OR REPLACE INTO equity (day, at, capital_usd, realized_usd,"
+        " unrealized_usd, equity_usd) VALUES (?, ?, ?, ?, ?, ?)",
+        (day.isoformat(), _now(), capital, round(realized, 2),
+         round(unrealized, 2), round(capital + realized + unrealized, 2)),
+      )
+
+  def max_drawdown_pct(self) -> float:
+    """Largest peak-to-trough fall in daily equity, as % of the peak."""
+    rows = self.conn.execute("SELECT equity_usd FROM equity ORDER BY day").fetchall()
+    peak, worst = None, 0.0
+    for r in rows:
+      e = r["equity_usd"]
+      peak = e if peak is None else max(peak, e)
+      if peak > 0:
+        worst = max(worst, (peak - e) / peak * 100)
+    return round(worst, 1)
+
+  def day_stats(self, day: dt.date) -> dict:
+    """Summarise what happened on a New York trading day."""
+    d = day.isoformat()
+    opened = self.conn.execute(
+      "SELECT COUNT(*) AS n FROM positions WHERE opened_on = ?", (d,),
+    ).fetchone()["n"]
+    # US regular hours fall inside one UTC date, so UTC timestamps match the day.
+    closed = self.conn.execute(
+      "SELECT COUNT(*) AS n, COALESCE(SUM(realized_pnl_usd), 0) AS pnl"
+      " FROM positions WHERE status = 'closed' AND substr(closed_at, 1, 10) = ?",
+      (d,),
+    ).fetchone()
+    outcomes = dict(self.conn.execute(
+      "SELECT COALESCE(outcome, 'none'), COUNT(*) FROM decisions"
+      " WHERE substr(decided_at, 1, 10) = ? GROUP BY 1",
+      (d,),
+    ).fetchall())
+    return {"opened": opened, "closed": closed["n"], "closed_pnl": closed["pnl"],
+            "decisions": outcomes}
+
+  def closed_count(self) -> int:
+    """Count closed positions so far."""
+    return self.conn.execute(
+      "SELECT COUNT(*) AS n FROM positions WHERE status = 'closed'",
+    ).fetchone()["n"]
+
   # -------------------------------------------------------------- decisions
 
   def record_decision(self, **fields: object) -> int:

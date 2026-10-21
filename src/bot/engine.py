@@ -25,6 +25,7 @@ from src.bot.exits import (
   stock_close_plan,
   take_profit_price,
 )
+from src.bot.notify import Notifier
 from src.bot.store import PositionRow, Store
 from src.guard import GuardContext, KillSwitch, evaluate, halt_file_present, kill_reason
 from src.guard.models import (
@@ -47,6 +48,9 @@ CLOSED_POLL = dt.timedelta(minutes=5)
 TP_CANCEL_WAIT_S = 15
 TICK_TIMEOUT_S = 900  # a hung IBKR call must not stop the loop (and exits) forever
 UNKNOWN_ORDER_GRACE = dt.timedelta(days=1)
+SUMMARY_AFTER_CLOSE = dt.timedelta(minutes=10)
+HEARTBEAT_BEFORE_OPEN = dt.timedelta(minutes=30)
+HEARTBEAT_AFTER_CLOSE = dt.timedelta(minutes=30)
 
 @dataclass
 class Clocks:
@@ -67,8 +71,12 @@ class Engine:
     settings: Settings,
     claude: anthropic.AsyncAnthropic | None,
     data_dir: Path,
+    notifier: Notifier | None = None,
   ) -> None:
     """Wire the parts together."""
+    self.notifier = notifier or Notifier()
+    # Notifications raised in sync code; sent at the end of each pass.
+    self._outbox: list[tuple[str, str, str, str | None]] = []
     self.broker = broker
     self.store = store
     self.kill = kill_switch
@@ -133,6 +141,15 @@ class Engine:
     return round_trip_commission(legs, qty, c.commission_per_contract,
                                  c.commission_min_per_order) / 2
 
+  def _say(self, title: str, message: str, priority: str = "default",
+           key: str | None = None) -> None:
+    self._outbox.append((title, message, priority, key))
+
+  async def _flush(self) -> None:
+    outbox, self._outbox = self._outbox, []
+    for title, message, priority, key in outbox:
+      await self.notifier.send(title, message, priority=priority, key=key)
+
   # ------------------------------------------------------------- reconcile
 
   async def reconcile(self, account: AccountState) -> None:
@@ -162,6 +179,12 @@ class Engine:
     for h in self._orphans:
       logger.error("Option {} {} {} x{} held but not in the bot's book; entries "
                    "paused until resolved", h.symbol, h.expiry, h.strike, h.quantity)
+    if self._orphans:
+      held = ", ".join(f"{h.symbol} {h.expiry} {h.strike:g}{h.right} x{h.quantity:g}"
+                       for h in self._orphans)
+      self._say("Unknown options in account",
+                f"{held}. New entries are paused until these are closed or "
+                "explained.", "high", key="orphans")
 
   async def _resolve_order(self, row: object) -> None:
     status = await self.broker.find_order(row["perm_id"], row["order_id"])
@@ -214,7 +237,12 @@ class Engine:
       tp_order_id=None, tp_perm_id=None, realized_pnl_usd=0.0,
     ))
     self.store.update_order(row["id"], position_id=pid)
+    self.store.record_fill(position_id=pid, kind="open",
+                           description=f"BUY {_legs_text(legs)}", quantity=qty,
+                           price=price, multiplier=100, commission_usd=fee,
+                           cash_usd=-(price * 100 * qty + fee), at=row["created_at"])
     logger.warning("Adopted position {} from an order filled while unattended", pid)
+    self._say("Adopted a missed fill", f"{pid}: {_legs_text(legs)} x{qty} at {price}")
 
   async def _book_external(self, p: PositionRow, qty: int) -> None:
     """Book `qty` of a position that was closed outside the bot's own orders."""
@@ -229,6 +257,9 @@ class Engine:
       # Unknown exit: book the worst case so budget and kill switch stay safe.
       exit_price, reason = 0.0, "external_unknown"
       logger.warning("Position {} x{} gone from IBKR; booking worst case", p.id, qty)
+      self._say("Position gone from IBKR",
+                f"{_describe(p)} x{qty} is no longer held and no exit was seen. "
+                "Booked as a full loss; check the account.", "high")
     self._book_close(p, qty, exit_price, None if exit_price else 0.0, reason)
 
   def _book_close(
@@ -242,12 +273,20 @@ class Engine:
     pnl = ((exit_price or 0.0) - p.entry_price) * 100 * qty - (
       p.entry_commission * qty / p.quantity) - fee
     self.store.reduce_position(p.id, qty, exit_price, round(pnl, 2), reason)
+    self.store.record_fill(
+      position_id=p.id, kind="external" if reason == "external_unknown" else "close",
+      description=f"SELL {_describe(p)}", quantity=qty, price=exit_price,
+      multiplier=100, commission_usd=fee,
+      cash_usd=(exit_price or 0.0) * 100 * qty - fee,
+    )
     logger.info("Booked {} x{} ({}) at {}: P&L ${:.2f}", p.id, qty, reason,
                 exit_price, pnl)
+    self._say(f"Closed {p.id} ({reason.replace('_', ' ')})",
+              f"{_describe(p)} x{qty} at {exit_price}: P&L ${pnl:+.2f}")
 
   # ------------------------------------------------------------------ exits
 
-  async def exit_cycle(self) -> None:  # noqa: C901 (one pass, in PLAN.md order)
+  async def exit_cycle(self) -> None:  # noqa: C901, PLR0912 (one pass, PLAN.md order)
     """Handle assignment, the kill switch, exit rules and resting take-profits."""
     account = await self.broker.account_state()
     clock = await self.broker.market_clock()
@@ -270,9 +309,12 @@ class Engine:
       equity = capital + self.store.realized_total() + sum(
         _unrealized(p, quotes, account) for p in positions
       )
-      if reason := kill_reason(equity, capital, self.store.consecutive_losses(),
-                               self.strategy):
-        self.kill.trip(reason)
+      reason = kill_reason(equity, capital, self.store.consecutive_losses(),
+                           self.strategy)
+      if reason and self.kill.trip(reason):
+        self._say("KILL SWITCH TRIPPED",
+                  f"{reason}. Closing everything; no new trades until you run "
+                  "--reset-kill-switch.", "urgent")
 
     for booked in self.store.open_positions():
       if booked.id in self._missing:
@@ -298,6 +340,12 @@ class Engine:
             and p.tp_order_id is None and p.opened_on < clock.today):
         await self._place_take_profit(p, quotes, account, clock)
 
+    if capital is not None:  # the day's last snapshot is its closing equity
+      self.store.record_equity(
+        clock.today, capital, self.store.realized_total(),
+        sum(_unrealized(p, quotes, account) for p in self.store.open_positions()),
+      )
+
   async def _close_stock(
     self, h: Holding, quotes: dict[int, LegQuote], positions: list[PositionRow],
     account: AccountState, clock: MarketClock,
@@ -307,6 +355,9 @@ class Engine:
     plan = stock_close_plan(h.con_id, h.symbol, h.quantity, quotes.get(h.con_id))
     if plan is None:
       logger.error("Cannot price stock {} to close it", h.symbol)
+      self._say("Can't close assigned stock",
+                f"{h.symbol} x{h.quantity:g}: no usable quote. Close it by hand.",
+                "urgent", key=f"stock-{h.con_id}")
       return
     related = next((p for p in positions if p.symbol == h.symbol and p.short_con_id
                     and _held(account, p.short_con_id) == 0), None) or next(
@@ -315,6 +366,18 @@ class Engine:
                                     related.id if related else None, account, clock)
     if result is None or result.filled <= 0 or result.avg_price is None:
       return
+    buying = h.quantity < 0
+    fee = result.commission or 1.0
+    self.store.record_fill(
+      position_id=related.id if related else None, kind="stock",
+      description=f"{'BUY' if buying else 'SELL'} {h.symbol} stock (assignment)",
+      quantity=result.filled, price=result.avg_price, multiplier=1,
+      commission_usd=fee,
+      cash_usd=(-1 if buying else 1) * result.avg_price * result.filled - fee,
+    )
+    self._say("Assignment handled",
+              f"{h.symbol} stock x{result.filled:g} closed at {result.avg_price}",
+              "high")
     if h.avg_cost is None or related is None:
       logger.error("Stock {} closed but its P&L can't be attributed", h.symbol)
       return
@@ -339,8 +402,18 @@ class Engine:
     result = await self._send_close(plan.intent, plan.start_price, plan.step, p.id,
                                     account, clock)
     if result is not None and result.filled > 0 and result.avg_price is not None:
-      cost = result.avg_price * 100 * result.filled + (result.commission or 1.0)
+      fee = result.commission or 1.0
+      cost = result.avg_price * 100 * result.filled + fee
       self.store.add_realized(p.id, -round(cost, 2))
+      self.store.record_fill(
+        position_id=p.id, kind="short_buyback",
+        description=f"BUY back {p.symbol} {p.expiry} {p.short_strike:g}{p.right}",
+        quantity=result.filled, price=result.avg_price, multiplier=100,
+        commission_usd=fee, cash_usd=-cost,
+      )
+      self._say("Bought back a lone sold leg",
+                f"{p.id}: {p.short_strike:g}{p.right} x{result.filled:g} at "
+                f"{result.avg_price}", "high")
 
   async def _close_position(
     self, p: PositionRow, reason: CloseReason, quotes: dict[int, LegQuote],
@@ -364,6 +437,8 @@ class Engine:
     plan = close_plan(p, quotes, reason)
     if plan is None:
       logger.error("Cannot price {} to close it ({})", p.id, reason)
+      self._say("Can't price a close", f"{_describe(p)} ({reason}): no quotes.",
+                "high", key=f"price-{p.id}")
       return
     result = await self._send_close(plan.intent, plan.start_price, plan.step, p.id,
                                     account, clock)
@@ -383,6 +458,9 @@ class Engine:
     decision, approval = evaluate(ctx, self.store.conn)
     if approval is None:
       logger.error("Guard blocked closing order: {}", decision.failures)
+      self._say("Guard blocked a close",
+                "; ".join(f"{r.gate}: {r.reason}" for r in decision.failures),
+                "high", key=f"close-block-{position_id}")
       return None
     return await execute(self.broker, self.store, approval, start_price=start,
                          step=step, position_id=position_id,
@@ -412,6 +490,9 @@ class Engine:
                    "because this is an emergency", p.id)
       return True
     logger.error("Take-profit for {} not confirmed cancelled; not closing yet", p.id)
+    self._say("Take-profit cancel unconfirmed",
+              f"{p.id}: waiting before closing ({_describe(p)}).", "high",
+              key=f"tp-{p.id}")
     return False
 
   async def _place_take_profit(
@@ -526,20 +607,22 @@ class Engine:
                        underlyings={v.underlying: info}, whatif=whatif)
     decision, approval = evaluate(ctx, self.store.conn)
     if approval is None:
-      return "rejected: " + "; ".join(
-        f"{r.gate}: {r.reason}" for r in decision.failures
-      )
+      why = "; ".join(f"{r.gate}: {r.reason}" for r in decision.failures)
+      self._say("Trade blocked by the guard",
+                f"Claude was {v.direction} on {v.underlying}; {why}", "low",
+                key="entry-reject")
+      return "rejected: " + why
     classified, _ = classify_open(plan.intent)
     result = await execute(self.broker, self.store, approval,
                            start_price=plan.start_price, step=0.01,
                            fingerprint=fingerprint(classified),
                            interval_s=self.reprice_interval_s, poll_s=self.poll_s)
     if result.filled > 0 and result.status in ("filled", "partial"):
-      self._record_fill(plan, result, clock)
+      self._record_fill(plan, result, clock, v)
     return result.status
 
   def _record_fill(
-    self, plan: TradePlan, result: ExecResult, clock: MarketClock,
+    self, plan: TradePlan, result: ExecResult, clock: MarketClock, v: brain.View,
   ) -> None:
     c = plan.candidate
     qty = int(result.filled)
@@ -558,22 +641,49 @@ class Engine:
       tp_order_id=None, tp_perm_id=None, realized_pnl_usd=0.0,
     ))
     self.store.update_order(result.order_row, position_id=pid)
+    p = next(x for x in self.store.open_positions() if x.id == pid)
+    self.store.record_fill(position_id=pid, kind="open",
+                           description=f"BUY {_describe(p)}", quantity=qty,
+                           price=price, multiplier=100, commission_usd=fee,
+                           cash_usd=-(price * 100 * qty + fee))
     logger.info("Opened {}: {} {} x{} at {}", pid, c.symbol, c.structure, qty, price)
+    self._say(f"Opened {pid}",
+              f"{_describe(p)} x{qty} at {price} (max loss ${p.max_loss_usd:.2f}). "
+              f"Claude {v.confidence:.0%} {v.direction}: {v.rationale}")
 
   # -------------------------------------------------------------------- loop
 
   async def tick(self) -> dt.timedelta:
     """One pass; returns how long to wait before the next."""
+    try:
+      return await self._tick()
+    finally:
+      await self._flush()
+
+  async def _tick(self) -> dt.timedelta:
     changes, error = self.settings_store.reload()
     if error:
       logger.warning("Settings edit rejected: {}", error)
+      self._say("Settings edit rejected", f"Keeping the previous settings. {error}",
+                "high", key="settings-error")
     elif changes:
       logger.info("Settings changed: {}", changes)
+      self._say("Settings changed", "\n".join(changes))
     await self.broker.ensure_connected()
     clock = await self.broker.market_clock()
+    if clock.session_open is not None and (
+      clock.session_open - HEARTBEAT_BEFORE_OPEN <= clock.now
+      <= clock.session_close + HEARTBEAT_AFTER_CLOSE
+    ):
+      await self.notifier.heartbeat()
     if clock.session_open is None or not (
       clock.session_open <= clock.now <= clock.session_close
     ):
+      if (clock.session_close is not None
+          and clock.now >= clock.session_close + SUMMARY_AFTER_CLOSE
+          and self.store.get_state("last_summary") != clock.today.isoformat()):
+        self.store.set_state("last_summary", clock.today.isoformat())
+        self._say(f"Daily summary {clock.today}", self.daily_summary(clock.today))
       return CLOSED_POLL
     s = self.strategy
     if _due(self.clocks.last_exit, clock.now, s.exits.exit_interval_minutes):
@@ -584,17 +694,62 @@ class Engine:
       await self.entry_cycle()
     return dt.timedelta(seconds=TICK_SECONDS)
 
+  def daily_summary(self, day: dt.date) -> str:
+    """Plain-text day report, including progress towards the go-live criteria."""
+    stats = self.store.day_stats(day)
+    capital = float(self.store.get_state("capital_usd") or 0)
+    realized = self.store.realized_total()
+    row = self.store.conn.execute(
+      "SELECT equity_usd FROM equity WHERE day = ?", (day.isoformat(),),
+    ).fetchone()
+    equity = row["equity_usd"] if row else capital + realized
+    outcomes: dict[str, int] = {}
+    for outcome, n in stats["decisions"].items():
+      key = outcome.split(":")[0]
+      outcomes[key] = outcomes.get(key, 0) + n
+    g = self.strategy.go_live
+    closed = self.store.closed_count()
+    lines = [
+      f"Equity ${equity:.2f} (capital ${capital:.2f}, realised ${realized:+.2f})",
+      f"Today: {stats['opened']} opened, {stats['closed']} closed "
+      f"(${stats['closed_pnl']:+.2f})",
+      "Claude: " + (", ".join(f"{k} {v}" for k, v in sorted(outcomes.items()))
+                    or "not asked"),
+      "Open: " + (", ".join(f"{p.id} {_describe(p)}"
+                            for p in self.store.open_positions()) or "none"),
+      f"Go-live: {closed}/{g.min_closed_trades} trades, max drawdown "
+      f"{self.store.max_drawdown_pct()}% (limit {g.max_drawdown_pct:g}%)",
+    ]
+    if self.kill.tripped:
+      lines.append(f"KILL SWITCH ON: {self.kill.reason}")
+    if self.broker.dry_run:
+      lines.append("Mode: dry run (no orders sent)")
+    return "\n".join(lines)
+
   async def run(self) -> None:
     """Run until stopped. Errors in a pass are logged and the loop continues."""
     mode = "DRY RUN (no orders sent)" if self.broker.dry_run else "PAPER/LIVE ORDERS"
     logger.info("Bot starting: {}", mode)
+    await self.notifier.send("Bot started", mode, priority="low")
     while True:
       try:
         wait = await asyncio.wait_for(self.tick(), TICK_TIMEOUT_S)
-      except Exception:
+      except Exception as e:
         logger.exception("Pass failed; retrying shortly")
+        await self.notifier.send("Bot error", f"{type(e).__name__}: {e}",
+                                 priority="high", key=f"error-{type(e).__name__}")
         wait = dt.timedelta(seconds=60)
       await asyncio.sleep(wait.total_seconds())
+
+def _describe(p: PositionRow) -> str:
+  strikes = f"{p.long_strike:g}" + (f"/{p.short_strike:g}" if p.short_strike else "")
+  kind = "spread" if p.short_con_id else ""
+  return f"{p.symbol} {p.expiry} {strikes}{p.right} {kind}".strip()
+
+def _legs_text(legs: list[dict]) -> str:
+  first = legs[0]
+  strikes = "/".join(f"{leg['strike']:g}" for leg in legs)
+  return f"{first['symbol']} {first['expiry']} {strikes}{first['right']}"
 
 def _due(last: dt.datetime | None, now: dt.datetime, minutes: int) -> bool:
   return last is None or now - last >= dt.timedelta(minutes=minutes)

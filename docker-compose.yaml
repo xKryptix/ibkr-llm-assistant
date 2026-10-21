@@ -36,6 +36,8 @@ services:
       IB_CLIENT_ID: 11
       # Dry run until you set DRY_RUN=false in .env.
       DRY_RUN: ${DRY_RUN:-true}
+      NTFY_TOPIC: ${NTFY_TOPIC:-}
+      HEARTBEAT_URL: ${HEARTBEAT_URL:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       QUOTES_API_KEY: ${QUOTES_API_KEY:-}
     volumes:

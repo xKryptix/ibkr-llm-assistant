@@ -29,6 +29,11 @@ async def main() -> None:
     action="store_true",
     help="Run the trading bot (dry run unless DRY_RUN=false)")
   parser.add_argument(
+    "--tax-export",
+    type=int,
+    metavar="FY",
+    help="Write AUD tax CSVs for a financial year (2027 = Jul 2026 to Jun 2027)")
+  parser.add_argument(
     "--reset-kill-switch",
     action="store_true",
     help="Re-enable new entries after the kill switch tripped")
@@ -46,6 +51,15 @@ async def main() -> None:
       Console().print(f"Kill switch reset (it had tripped because: {reason})")
     else:
       Console().print("Kill switch was not tripped; nothing to reset")
+  elif args.tax_export:
+    from pathlib import Path
+    from src.bot.store import Store
+    from src.bot.tax import write_tax_export
+    from src.storage import connect
+    data_dir = Path(settings.data_dir)
+    store = Store(connect(data_dir / "bot.sqlite"))
+    for path in write_tax_export(store, data_dir, args.tax_export):
+      Console().print(f"Wrote {path}")
   elif args.trade:
     from src.bot import run_bot
     await run_bot(settings)

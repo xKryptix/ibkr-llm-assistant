@@ -29,6 +29,12 @@ class Settings(BaseSettings):
   allow_live: bool = False
   live_confirm: str | None = None
 
+  # Phone notifications via ntfy (install the ntfy app, subscribe to the topic).
+  ntfy_topic: str | None = None
+  ntfy_server: str = "https://ntfy.sh"
+  # Dead-man's switch (e.g. a healthchecks.io ping URL), pinged during US hours.
+  heartbeat_url: str | None = None
+
   # Optional FMP quotes/economic calendar API (MCP CLI only)
   quotes_api_key: str | None = None
 

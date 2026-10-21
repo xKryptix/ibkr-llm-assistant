@@ -6,6 +6,7 @@ from loguru import logger
 
 from src.bot.broker import IBBroker
 from src.bot.engine import Engine
+from src.bot.notify import Notifier
 from src.bot.store import Store
 from src.guard import KillSwitch
 from src.storage import connect
@@ -30,5 +31,9 @@ async def run_bot(settings: Settings) -> None:
     settings=settings,
     claude=claude,
     data_dir=data_dir,
+    notifier=Notifier(topic=settings.ntfy_topic, server=settings.ntfy_server,
+                      heartbeat_url=settings.heartbeat_url),
   )
+  if not settings.ntfy_topic:
+    logger.warning("NTFY_TOPIC not set: notifications only go to the log")
   await engine.run()
