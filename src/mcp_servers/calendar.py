@@ -1,6 +1,5 @@
 """MCP Calendar server."""
 
-import json
 import pytz
 import pandas as pd
 import exchange_calendars as xcals

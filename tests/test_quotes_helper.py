@@ -1,7 +1,7 @@
 """Tests for quotes_helper module."""
 import pytest
 from unittest.mock import AsyncMock, patch
-from src.quote_helpers.fmp_quotes_helper import FMPQuoteFetcher
+from src.fmp_helpers.fmp_quotes_helper import FMPQuoteFetcher
 from src.utilities.settings import Settings
 
 
@@ -14,7 +14,7 @@ def mock_settings() -> Settings:
 @pytest.fixture
 def quote_fetcher(mock_settings: Settings) -> FMPQuoteFetcher:
   """Create FMPQuoteFetcher instance with mock settings."""
-  with patch("src.quote_helpers.fmp_quotes_helper.Settings", return_value=mock_settings):
+  with patch("src.fmp_helpers.fmp_quotes_helper.Settings", return_value=mock_settings):
       return FMPQuoteFetcher()
 
 
@@ -33,6 +33,7 @@ async def test_get_spot_quote_success(quote_fetcher: FMPQuoteFetcher) -> None:
     assert price == 150.25
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_get_spot_quote_returns_float(quote_fetcher: FMPQuoteFetcher) -> None:
   """Test that spot quote returns a non-null float value using real API."""

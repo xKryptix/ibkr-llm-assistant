@@ -89,7 +89,8 @@ async def get_events(from_date: str, to_date: str) -> str:
   Example:
       >>> await get_events("2025-06-09", "2025-06-10")
       '[{"date": "2025-06-09", "event": "CPI", "impact": "High", "country": "US"}]'
-      >>> await get_events("2025-06-09", "2025-06-10", impact=["High"], countries=["US"])
+      >>> await get_events(
+      ...   "2025-06-09", "2025-06-10", impact=["High"], countries=["US"])
       '[{"date": "2025-06-09", "event": "CPI", "impact": "High", "country": "US"}]'
 
   """

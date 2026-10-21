@@ -1,4 +1,4 @@
-"""MCP server setup."""
+"""IBKR MCP server: read-only tools (no order placement)."""
 from fastmcp import FastMCP
 
 from src.utilities import setup_logging
@@ -14,4 +14,3 @@ ib_interface = IBInterface()
 from .positions import *
 from .scanner import *
 from .contracts import *
-from .trading import *

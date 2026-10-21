@@ -4,6 +4,8 @@ import pandas as pd
 from io import StringIO
 from src.ib_helper import IBInterface
 
+pytestmark = pytest.mark.integration
+
 @pytest.fixture
 async def ib_interface() -> IBInterface:
   """Fixture to create and cleanup IB interface instance."""

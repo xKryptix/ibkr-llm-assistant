@@ -19,6 +19,9 @@ class MCPClient:
     self.settings = settings
     self.session: ClientSession | None = None
     self.exit_stack = AsyncExitStack()
+    if not settings.anthropic_api_key:
+      msg = "ANTHROPIC_API_KEY is not set; it is required for --query and --cli"
+      raise ValueError(msg)
     self.anthropic = Anthropic(api_key=settings.anthropic_api_key)
     self.message_history = []
 

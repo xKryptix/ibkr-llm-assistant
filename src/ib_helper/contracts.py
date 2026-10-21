@@ -70,6 +70,7 @@ class ContractClient(IBClient):
       )
 
       contracts = await self.ib.qualifyContractsAsync(contract)
+      contracts = [c for c in contracts if isinstance(c, Contract)]
       contracts = util.df(contracts)
       contracts = contracts[[
         "conId",
@@ -156,6 +157,7 @@ class ContractClient(IBClient):
 
       try:
         contracts = await self.ib.qualifyContractsAsync(*contracts)
+        contracts = [c for c in contracts if isinstance(c, Contract)]
         contracts = util.df(contracts)
         contracts = contracts[[
           "conId",

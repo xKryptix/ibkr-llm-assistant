@@ -40,7 +40,10 @@ class MarketDataClient(IBClient):
     try:
       await self._connect()
       contracts = [Contract(conId=contract_id) for contract_id in contract_ids]
-      qualified_contracts = await self.ib.qualifyContractsAsync(*contracts)
+      qualified_contracts = [
+        c for c in await self.ib.qualifyContractsAsync(*contracts)
+        if isinstance(c, Contract)
+      ]
 
       # First attempt to get tickers
       if self._is_market_open():
@@ -77,9 +80,8 @@ class MarketDataClient(IBClient):
       has_greeks = any(result["greeks"].apply(lambda x: bool(x)))
 
       if not has_greeks:
-        logger.warning("No greeks data received, restarting gateway...")
-        await self.send_command_to_ibc("RESTART")
-        await asyncio.sleep(30)
+        logger.warning("No greeks data received, retrying once...")
+        await asyncio.sleep(5)
         await self._connect()
 
         # Second attempt
