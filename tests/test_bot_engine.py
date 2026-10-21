@@ -4,9 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from src.bot import brain as brain_module
 from src.bot.broker import LegQuote, OrderStatus
-from src.bot.brain import BrainResult, View
+from src.bot.brain import View
 from src.bot.engine import Engine
 from src.bot.store import PositionRow, Store
 from src.guard import KillSwitch
@@ -31,18 +30,6 @@ def make_engine(tmp_path: Path, broker: FakeBroker) -> Engine:
   engine.poll_s = 0
   engine.now = lambda: broker.now
   return engine
-
-@pytest.fixture
-def claude_says(monkeypatch: pytest.MonkeyPatch) -> list:
-  """Make brain.ask return the given view; records each call."""
-  calls: list = []
-  def set_view(view: View | None, error: str | None = None) -> None:
-    async def fake_ask(*args: object) -> BrainResult:
-      calls.append(args)
-      return BrainResult(view, error, "claude-sonnet-5-5")
-    monkeypatch.setattr(brain_module, "ask", fake_ask)
-  calls.append(set_view)
-  return calls
 
 def held_spread(broker: FakeBroker, long_id: int = 1602, short_id: int = 1603) -> None:
   """Put the 602/603 call spread in the fake account."""

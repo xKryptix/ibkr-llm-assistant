@@ -254,10 +254,10 @@ Researched on 2026-10-21. **It most likely doesn't limit this account, but the b
 
 | Phase | Deliverables |
 |---|---|
-| **1. Modernise** | Settings made optional, new model default, Postgres and web UI removed, SQLite added. Compose switched to gnzsnz in paper mode. Read-only MCP CLI. **Price-survey script.** Replace the inherited `docker-publish.yml`, which pushes to the original author's registry, with a PR workflow that runs ruff and pytest. Tests and ruff pass. |
-| **2. Risk guard** | `guard/` package with every §5.3 gate, the kill switch, the `HALT` file and the paper/live check. Adversarial unit tests. |
-| **3. Strategy and execution** | Snapshot, brain (forced tool), builder, executor (preview, reprice ladder, reconcile), exit manager with assignment handling, scheduler. Dry-run mode. |
-| **4. Journal and alerts** | SQLite journal, ntfy alerts, heartbeat, daily summary, tax CSV with RBA rates. |
+| **1. Modernise** ✅ | Settings made optional, new model default, Postgres and web UI removed, SQLite added. Compose switched to gnzsnz in paper mode. Read-only MCP CLI. **Price-survey script.** Replace the inherited `docker-publish.yml`, which pushes to the original author's registry, with a PR workflow that runs ruff and pytest. Tests and ruff pass. |
+| **2. Risk guard** ✅ | `guard/` package with every §5.3 gate, the kill switch, the `HALT` file and the paper/live check. Adversarial unit tests. |
+| **3. Strategy and execution** ✅ | Snapshot, brain (structured output; forced tool use is not available on current models), builder, executor (preview, reprice ladder, reconcile), exit manager with assignment handling, scheduler. Dry-run mode. |
+| **4. Journal and alerts** ✅ | SQLite journal, ntfy alerts, heartbeat, daily summary, tax CSV with RBA rates. Cross-checking against IBKR Flex reports (`ibflex`) is still to do. |
 | **5. Paper trading** | 4–8 weeks with a weekly review of the journal. Tune the thresholds. |
 | **6. Optional** | Read-only status page (Tailscale), move to TrueNAS, SPY Swing Lab signal hook. |
 

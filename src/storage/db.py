@@ -116,6 +116,29 @@ MIGRATIONS = [
     error TEXT
   );
   """,
+  """
+  CREATE TABLE fills (
+    id INTEGER PRIMARY KEY,
+    at TEXT NOT NULL,
+    position_id TEXT,
+    kind TEXT NOT NULL,
+    description TEXT NOT NULL,
+    quantity REAL NOT NULL,
+    price REAL,
+    multiplier INTEGER NOT NULL,
+    commission_usd REAL NOT NULL,
+    cash_usd REAL NOT NULL
+  );
+  CREATE INDEX fills_position ON fills (position_id);
+  CREATE TABLE equity (
+    day TEXT PRIMARY KEY,
+    at TEXT NOT NULL,
+    capital_usd REAL NOT NULL,
+    realized_usd REAL NOT NULL,
+    unrealized_usd REAL NOT NULL,
+    equity_usd REAL NOT NULL
+  );
+  """,
 ]
 
 def connect(path: Path) -> sqlite3.Connection:
