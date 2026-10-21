@@ -11,7 +11,8 @@
 | Topic | Decision |
 |---|---|
 | Broker | Interactive Brokers (IBKR) |
-| What it trades | US-listed options on **SPY and QQQ** only, 2–10 DTE at entry |
+| What it trades | US-listed options on **SPY and QQQ** only, 3–10 DTE at entry, always closed at 2 DTE |
+| **No debt** | **Sebastian can never lose more than he put in, and the bot never borrows.** See §5.6 for how this is enforced and the one remaining edge case. |
 | Structures | **Long calls/puts and debit verticals only.** No credit spreads, condors or butterflies, no stock, no naked short legs. |
 | Capital | **A$500**, converted to USD (see §4) |
 | Mode | IBKR **paper** account first, then a small live account only after the go-live criteria in §9 are met |
@@ -57,7 +58,7 @@ Not used: `lumibot` (GPL), `optopsy` (AGPL; may be used later as a separate offl
   - Long option: the premium paid plus commissions.
   - Debit vertical: the net debit × 100 × qty, plus commissions. The width of the spread caps this from above.
 - **Budget across the book:** the sum of max loss over open positions plus the new order must be ≤ `capital_usd` minus realised losses.
-- **What this means:** in practice the bot will mostly trade **1-lot, $1–$2-wide debit verticals**. Single long options near the money usually cost more than US$50 at 2–10 DTE. Commissions are about US$0.65 per contract leg each way, so roughly US$2.60 per 1-lot vertical round trip. That is a meaningful share of a ~US$50 risk.
+- **What this means:** in practice the bot will mostly trade **1-lot, $1–$2-wide debit verticals**. Single long options near the money usually cost more than US$50 at 3–10 DTE. Commissions are about US$0.65 per contract leg each way, so roughly US$2.60 per 1-lot vertical round trip. That is a meaningful share of a ~US$50 risk.
   - **Phase 1 deliverable:** a read-only *price survey* script that logs real paper-account quotes for candidate spreads for a week, so we can settle the cap with real numbers rather than guesses.
 
 ## 5. How a trade happens
@@ -80,7 +81,7 @@ every 15 min (and on start-up): exit manager (code only, no Claude)
 - Rationale is stored in the journal so decisions can be reviewed.
 
 ### 5.2 Builder (code)
-- Expiry: the nearest expiry with DTE in `[min_dte, max_dte]` (default 2–10). Prefer ~5–7 DTE.
+- Expiry: the nearest expiry with DTE in `[min_dte, max_dte]` (default 3–10). Prefer ~5–7 DTE.
 - Long option: strike nearest a target delta (default 0.40).
 - Debit vertical: long leg near 0.45–0.55 delta, short leg `width` further out of the money on the **same right and expiry**. Width is tried as $1, then $2, keeping the first that fits the cap.
 - Quantity: the most contracts that fit the cap, at most `max_contracts`. **Sizing can only shrink**: if anything is uncertain, it uses fewer contracts or none.
@@ -103,7 +104,7 @@ Every gate is a pure function that returns pass or fail plus a reason. **All gat
 | Book budget | Open max loss plus the new order ≤ `capital_usd` minus realised losses |
 | Max open positions | Default 3 |
 | Max new trades per day | Default 2 |
-| Day trades | If IBKR reports a day-trade limit, same-day closes are allowed only for stop, assignment or ≤1 DTE, with 1 day trade kept in reserve (§8) |
+| Day trades | If IBKR reports a day-trade limit, same-day closes are allowed only for stop, assignment or ≤2 DTE, with 1 day trade kept in reserve (§8) |
 | Cash | USD cash after the order ≥ 0. The `whatIfOrder` preview has no warnings. |
 | Duplicates | No identical open order or same-direction position on the same expiry |
 | Market hours | Inside regular hours from `liquidHours`. No entries in the first 15 or last 30 minutes. |
@@ -123,7 +124,7 @@ Every gate is a pure function that returns pass or fail plus a reason. **All gat
 It runs every 15 minutes in regular hours, and once at start-up. Rules, first match wins:
 
 1. **Stock position appears** (early assignment or exercise): close the stock and the remaining leg at once, then notify.
-2. **DTE ≤ 1:** close. The bot never holds into expiry.
+2. **DTE ≤ 2:** close. The bot never holds into the last 2 days, which leaves a spare day if the PC is off.
 3. **Stop loss:** the position is worth ≤ 50% of entry cost. Close.
 4. **Profit target:** the position is worth ≥ 150% of entry cost for a long option, or ≥ 80% of the spread's width for a vertical. Close.
 5. **Time stop:** held more than `max_hold_days` (default 4 trading days). Close.
@@ -131,6 +132,16 @@ It runs every 15 minutes in regular hours, and once at start-up. Rules, first ma
 Exits are valued at the unfavourable side of each quote (bid for longs, ask for shorts), not mid. Closing orders go through the same guard (the "closing orders" gate) and the same executor.
 
 *All thresholds are proposed defaults, to be tuned using paper results.*
+
+### 5.6 No debt: how it's enforced
+
+Sebastian's rule: **never lose more than what was put in, and never owe IBKR money.**
+
+- **Every position has a fixed maximum loss:** the premium or debit paid. No naked short legs, no stock, no credit structures (§5.3).
+- **No borrowing:** the guard refuses any order that would make USD cash negative. The account is funded in USD.
+- **No expiry risk:** entries at 3+ DTE, everything closed at 2 DTE. This avoids automatic exercise (a long call ending in the money would otherwise buy 100 shares, about US$60k of SPY) and pin risk on the short leg.
+- **Early assignment:** if the short leg of a debit spread is assigned, the account briefly holds stock. The long leg still caps the loss, but the stock position uses borrowed money until it's closed. The exit manager checks for stock **first** on every run and at start-up, and closes the stock and the remaining leg straight away. Assignment is more likely on short calls just before SPY/QQQ ex-dividend dates, so the guard won't open a call spread whose short leg is in the money or near it when an ex-dividend date falls before expiry.
+- **The one remaining edge case:** if the PC is off for **2 or more trading days** at the wrong moment, an assignment or expiry could leave stock bought with borrowed money until Sebastian or IBKR closes it. IBKR automatically liquidates positions in accounts with a margin shortfall. The heartbeat alert (§6) exists so this is noticed within hours.
 
 ## 6. Journal, alerts and tax
 
@@ -166,9 +177,9 @@ Exits are valued at the unfavourable side of each quote (bid for longs, ask for 
   - Docker starts at boot.
 - **If the PC is off or the bot is down:**
   - Losses are still capped: the most any position can lose is what it cost.
-  - What's lost is timely exits, and the ≤1 DTE close.
+  - What's lost is timely exits, and the ≤2 DTE close.
   - Mitigations:
-    - Entries need DTE ≥ 2.
+    - Entries need DTE ≥ 3, and closes happen at 2 DTE, so expiry is a full day away even if one night is missed.
     - The exit manager runs first on start-up.
     - From the session after entry, the bot keeps a **resting GTC take-profit limit order** on the combo, held by IBKR, so profits can be taken while the PC is down. The exit manager cancels it, and confirms the cancel, before sending any other close for that position.
     - The heartbeat alert tells Sebastian to start the PC again.
@@ -189,7 +200,7 @@ Researched on 2026-10-21. **It most likely doesn't limit this account, but the b
   - So the plan stays with a margin account (needed for spreads). The guard still requires USD cash ≥ 0, so the bot never borrows, and an intraday margin deficit shouldn't arise from debit trades.
 
 **Built into the bot regardless:**
-- The guard reads IBKR's `DayTradesRemaining` account value. If IBKR reports a limit, the bot only closes a position on the day it opened it for a stop, assignment or ≤1 DTE. It keeps 1 day trade in reserve for those.
+- The guard reads IBKR's `DayTradesRemaining` account value. If IBKR reports a limit, the bot only closes a position on the day it opened it for a stop, assignment or ≤2 DTE. It keeps 1 day trade in reserve for those.
 - The resting take-profit order (§7) is placed from the **next** session onward, so it can't create a same-day round trip.
 - Max 2 new trades a day. Holding periods are measured in days (§5.5), not minutes.
 - **Sebastian:** once the account is open, check the "Day Trades Left" field in Client Portal, or ask IBKR Australia support.
