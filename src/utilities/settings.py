@@ -22,6 +22,9 @@ class Settings(BaseSettings):
   ib_gateway_port: int = 4002
   ib_client_id: int | None = None
 
+  # Dry run: the bot does everything except send orders. Turn off with DRY_RUN=false.
+  dry_run: bool = True
+
   # Live trading needs BOTH: ALLOW_LIVE=true and LIVE_CONFIRM=<the live account id>.
   allow_live: bool = False
   live_confirm: str | None = None

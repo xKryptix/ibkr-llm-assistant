@@ -62,14 +62,20 @@ class SurveyClient(IBClient):
       price = _num(ticker.close)
     return stock, price
 
-  async def option_quotes(
+  async def option_quotes(  # noqa: PLR0913
     self,
     stock: Stock,
     spot: float,
     today: dt.date,
     strategy: StrategySettings,
+    *,
+    rights: tuple[str, ...] = ("C", "P"),
+    target_dte: int | None = None,
   ) -> list[OptionQuote]:
-    """Quotes for calls and puts near the money, for expiries in the DTE range."""
+    """Quotes near the money for expiries in the DTE range.
+
+    With `target_dte`, only the expiry closest to it (shorter on ties) is quoted.
+    """
     chains = await self.ib.reqSecDefOptParamsAsync(
       stock.symbol, "", "STK", stock.conId,
     )
@@ -84,13 +90,18 @@ class SurveyClient(IBClient):
       <= (dt.datetime.strptime(e, "%Y%m%d").date() - today).days  # noqa: DTZ007
       <= entries.max_dte
     )
+    if target_dte is not None and expiries:
+      expiries = [min(expiries, key=lambda e: (
+        abs((dt.datetime.strptime(e, "%Y%m%d").date() - today).days  # noqa: DTZ007
+            - target_dte), e,
+      ))]
     window = (
       spot * strategy.survey.strike_window_pct / 100 + max(entries.vertical_widths)
     )
     strikes = sorted(k for k in chain.strikes if abs(k - spot) <= window)
     contracts = [
       Option(stock.symbol, expiry, strike, right, "SMART", tradingClass=stock.symbol)
-      for expiry in expiries for strike in strikes for right in ("C", "P")
+      for expiry in expiries for strike in strikes for right in rights
     ]
     qualified = [
       c for c in await self.ib.qualifyContractsAsync(*contracts)
@@ -113,6 +124,8 @@ def _to_quote(ticker: Ticker) -> OptionQuote:
     bid=_num(ticker.bid),
     ask=_num(ticker.ask),
     delta=delta,
+    con_id=c.conId,
+    quoted_at=ticker.time or dt.datetime.now(dt.UTC),
   )
 
 def build_candidates(
