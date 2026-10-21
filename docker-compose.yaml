@@ -9,8 +9,9 @@ services:
       TWS_USERID: ${TWS_USERID}
       TWS_PASSWORD: ${TWS_PASSWORD}
       TRADING_MODE: paper
-      # Phase 1 only reads data. Phase 3 (guarded executor) switches this to "no".
-      READ_ONLY_API: "yes"
+      # The bot needs order access (also for IBKR's order preview in dry run).
+      # Every order still has to pass the bot's risk guard.
+      READ_ONLY_API: "no"
       TWOFA_TIMEOUT_ACTION: restart
       RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
       AUTO_RESTART_TIME: "11:59 PM"
@@ -33,10 +34,28 @@ services:
       IB_GATEWAY_HOST: ib-gateway
       IB_GATEWAY_PORT: 4004
       IB_CLIENT_ID: 11
+      # Dry run until you set DRY_RUN=false in .env.
+      DRY_RUN: ${DRY_RUN:-true}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       QUOTES_API_KEY: ${QUOTES_API_KEY:-}
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-    # Phase 1: log real prices during US market hours.
+    command: ["python", "main.py", "--trade"]
+
+  # Optional: log real option prices every 30 minutes (PLAN.md §4).
+  # Start with: docker compose --profile survey up -d
+  survey:
+    build: .
+    profiles: ["survey"]
+    restart: unless-stopped
+    depends_on:
+      - ib-gateway
+    environment:
+      IB_GATEWAY_HOST: ib-gateway
+      IB_GATEWAY_PORT: 4004
+      IB_CLIENT_ID: 12
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
     command: ["python", "main.py", "--price-survey"]

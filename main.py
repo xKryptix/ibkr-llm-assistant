@@ -25,6 +25,10 @@ async def main() -> None:
     action="store_true",
     help="With --price-survey: run one survey now and exit")
   parser.add_argument(
+    "--trade",
+    action="store_true",
+    help="Run the trading bot (dry run unless DRY_RUN=false)")
+  parser.add_argument(
     "--reset-kill-switch",
     action="store_true",
     help="Re-enable new entries after the kill switch tripped")
@@ -42,6 +46,9 @@ async def main() -> None:
       Console().print(f"Kill switch reset (it had tripped because: {reason})")
     else:
       Console().print("Kill switch was not tripped; nothing to reset")
+  elif args.trade:
+    from src.bot import run_bot
+    await run_bot(settings)
   elif args.price_survey:
     from src.survey import run_price_survey
     await run_price_survey(settings, once=args.once)

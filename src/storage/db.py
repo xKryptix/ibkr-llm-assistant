@@ -55,6 +55,67 @@ MIGRATIONS = [
     results_json TEXT NOT NULL
   );
   """,
+  """
+  CREATE TABLE bot_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE positions (
+    id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    expiry TEXT NOT NULL,
+    option_right TEXT NOT NULL,
+    structure TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    long_con_id INTEGER NOT NULL,
+    long_strike REAL NOT NULL,
+    short_con_id INTEGER,
+    short_strike REAL,
+    entry_price REAL NOT NULL,
+    entry_commission REAL NOT NULL,
+    max_loss_usd REAL NOT NULL,
+    opened_at TEXT NOT NULL,
+    opened_on TEXT NOT NULL,
+    tp_order_id INTEGER,
+    tp_perm_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'open',
+    closed_at TEXT,
+    exit_price REAL,
+    exit_reason TEXT,
+    realized_pnl_usd REAL NOT NULL DEFAULT 0
+  );
+  CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    reason TEXT,
+    position_id TEXT,
+    fingerprint TEXT,
+    intent_json TEXT NOT NULL,
+    start_price REAL,
+    limit_price REAL,
+    status TEXT NOT NULL,
+    order_id INTEGER,
+    perm_id INTEGER,
+    filled_qty REAL NOT NULL DEFAULT 0,
+    avg_fill_price REAL,
+    dry_run INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE TABLE decisions (
+    id INTEGER PRIMARY KEY,
+    decided_at TEXT NOT NULL,
+    model TEXT,
+    underlying TEXT,
+    direction TEXT,
+    structure TEXT,
+    confidence REAL,
+    rationale TEXT,
+    outcome TEXT,
+    error TEXT
+  );
+  """,
 ]
 
 def connect(path: Path) -> sqlite3.Connection:

@@ -1,7 +1,7 @@
 """Build candidate trades from option quotes (pure functions, no IBKR calls).
 
-The same selection rules (delta targets, widths, debit-only) will be reused by the
-Phase 3 builder; here they only feed the price survey.
+The same selection rules (delta targets, widths, debit-only) feed both the price
+survey and the trading builder (src/bot/builder.py).
 """
 import datetime as dt
 import math
@@ -21,6 +21,8 @@ class OptionQuote:
   bid: float
   ask: float
   delta: float | None
+  con_id: int = 0
+  quoted_at: dt.datetime | None = None
 
   @property
   def mid(self) -> float:

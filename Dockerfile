@@ -15,4 +15,4 @@ COPY main.py mcp_client.py mcp_server.py settings.example.toml ./
 RUN useradd -m appuser && mkdir -p data logs && chown -R appuser:appuser /app
 USER appuser
 
-CMD ["python", "main.py", "--price-survey"]
+CMD ["python", "main.py", "--trade"]
