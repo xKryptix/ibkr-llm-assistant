@@ -24,11 +24,25 @@ async def main() -> None:
     "--once",
     action="store_true",
     help="With --price-survey: run one survey now and exit")
+  parser.add_argument(
+    "--reset-kill-switch",
+    action="store_true",
+    help="Re-enable new entries after the kill switch tripped")
 
   args = parser.parse_args()
   settings = Settings()
 
-  if args.price_survey:
+  if args.reset_kill_switch:
+    from pathlib import Path
+    from src.guard import KillSwitch
+    from src.storage import connect
+    switch = KillSwitch(connect(Path(settings.data_dir) / "bot.sqlite"))
+    reason = switch.reason
+    if switch.reset():
+      Console().print(f"Kill switch reset (it had tripped because: {reason})")
+    else:
+      Console().print("Kill switch was not tripped; nothing to reset")
+  elif args.price_survey:
     from src.survey import run_price_survey
     await run_price_survey(settings, once=args.once)
   elif args.query or args.cli:

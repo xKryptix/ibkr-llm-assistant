@@ -110,6 +110,7 @@ Every gate is a pure function that returns pass or fail plus a reason. **All gat
 | Market hours | Inside regular hours from `liquidHours`. No entries in the first 15 or last 30 minutes. |
 | Kill switch | Not tripped (see below) and no `HALT` file present |
 | Closing orders | Can only reduce a position the bot holds, with the same legs reversed and the same or smaller quantity |
+| No new uncovered risk | A close may never leave a short option or stock less covered than before. For example, selling the bought leg of a spread while the sold leg is still open is rejected, and after an assignment the stock must be closed before the remaining long option. |
 
 **Kill switch (persistent):** if equity falls below `(1 − max_drawdown_pct) × capital_usd` (default 30%), or after `max_consecutive_losses` (default 4), the bot closes everything and writes the trip to SQLite. **It stays off until Sebastian resets it by hand** (`main.py --reset-kill-switch`).
 

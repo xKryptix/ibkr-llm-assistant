@@ -8,7 +8,13 @@ See **[PLAN.md](PLAN.md)** for the full design and phases.
 
 ## Status
 
-**Phase 1 (modernise), read-only.** Nothing in this repo can place orders yet. The guarded executor arrives in Phase 3.
+**Phases 1 and 2 done, still read-only.** Nothing in this repo can place orders yet. The guarded executor arrives in Phase 3.
+
+- **Phase 2 risk guard (`src/guard/`):** every order must pass every gate in PLAN.md §5.3, or it gets no `Approval`, and the Phase 3 executor will only accept an `Approval`. Also in this phase:
+  - a persistent kill switch, reset with `main.py --reset-kill-switch`
+  - a `data/HALT` file that stops new entries while exits keep running
+  - the paper-account check
+  - about 100 adversarial tests that try to sneak bad orders past the guard
 
 What works now:
 - **Paper IB Gateway in Docker** (`gnzsnz/ib-gateway`, pinned version).
