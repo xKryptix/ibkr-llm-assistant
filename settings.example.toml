@@ -1,0 +1,78 @@
+# Bot settings. The bot copies this file to data/settings.toml on first run;
+# edit data/settings.toml, not this file. Changes are picked up on the next
+# loop (no restart). An invalid edit is rejected as a whole and the previous
+# settings stay in force. See PLAN.md §5.7.
+#
+# Some rules are deliberately NOT settings and cannot be turned off here:
+# debit/long structures only, no naked shorts, no borrowing (USD cash >= 0),
+# close by 2 DTE, limit orders only, paper-only unless both live flags are set.
+
+[capital]
+# Money given to the bot, in Australian dollars. Converted to USD with IBKR's
+# AUD.USD rate.
+capital_aud = 500
+
+[risk]
+# Most a single trade may lose, as % of capital (max 50).
+risk_per_trade_pct = 15
+max_open_positions = 3
+max_trades_per_day = 2
+# Kill switch: close everything and stop if equity falls this far (% of capital).
+max_drawdown_pct = 30
+# Pause after this many losing trades in a row.
+max_consecutive_losses = 4
+# Largest quantity (contracts or spreads) per order.
+max_contracts = 2
+
+[entries]
+underlyings = ["SPY", "QQQ"]
+# Days to expiry when opening a trade. min_dte must be at least 3 because every
+# position is closed at 2 DTE.
+min_dte = 3
+max_dte = 10
+# Single long call/put: strike nearest this delta.
+long_option_delta = 0.40
+# Debit vertical: long leg nearest this delta, short leg `width` dollars further OTM.
+vertical_long_delta = 0.50
+vertical_widths = [1.0, 2.0]
+# Skip each leg whose bid/ask spread is wider than this % of its mid price.
+max_leg_spread_pct = 10
+# Minutes between entry checks during US market hours.
+entry_interval_minutes = 30
+# No new entries this many minutes after the open / before the close.
+skip_first_minutes = 15
+skip_last_minutes = 30
+
+[exits]
+# Close when the position is worth this % of what it cost (or less).
+stop_loss_pct = 50
+# Single option: take profit when worth this % of cost (150 = +50%).
+long_option_profit_target_pct = 150
+# Debit vertical: take profit when worth this % of the spread width.
+vertical_profit_target_pct_of_width = 80
+# Close after this many trading days regardless.
+max_hold_days = 4
+exit_interval_minutes = 15
+
+[brain]
+model = "claude-sonnet-5-5"
+# Claude's view must be at least this confident (0-1), otherwise abstain.
+min_confidence = 0.6
+
+[costs]
+# IBKR Pro fixed options commission (USD). Used to estimate round-trip costs.
+commission_per_contract = 0.65
+commission_min_per_order = 1.00
+
+[go_live]
+# Paper results needed before going live (PLAN.md §9).
+min_closed_trades = 40
+max_drawdown_pct = 25
+# Subtracted per leg per fill from paper P&L, because paper combo fills are optimistic.
+paper_fill_haircut_per_leg = 0.02
+
+[survey]
+# Price survey (Phase 1): minutes between runs during market hours.
+interval_minutes = 30
+# Only strikes within this % of the underlying price are quoted.
+strike_window_pct = 1.5
