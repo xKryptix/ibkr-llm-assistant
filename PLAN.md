@@ -12,7 +12,7 @@
 |---|---|
 | Broker | Interactive Brokers (IBKR) |
 | What it trades | US-listed options on **SPY and QQQ** only, 3–10 DTE at entry, always closed at 2 DTE |
-| **No debt** | **Sebastian can never lose more than he put in, and the bot never borrows.** See §5.6 for how this is enforced and the one remaining edge case. |
+| **No debt** | **Never lose more than what was put in, and the bot never borrows.** See §5.6 for how this is enforced and the one remaining edge case. |
 | Structures | **Long calls/puts and debit verticals only.** No credit spreads, condors or butterflies, no stock, no naked short legs. |
 | Capital | **A$500**, converted to USD (see §4) |
 | Mode | IBKR **paper** account first, then a small live account only after the go-live criteria in §9 are met |
@@ -139,7 +139,7 @@ Sebastian's rule: **never lose more than what was put in, and never owe IBKR mon
 
 - **Every position has a fixed maximum loss:** the premium or debit paid. No naked short legs, no stock, no credit structures (§5.3).
 - **No borrowing:** the guard refuses any order that would make USD cash negative. The account is funded in USD.
-- **No expiry risk:** entries at 3+ DTE, everything closed at 2 DTE. This avoids automatic exercise (a long call ending in the money would otherwise buy 100 shares, about US$60k of SPY) and pin risk on the short leg.
+- **No expiry risk:** entries at 3+ DTE, everything closed at 2 DTE. This avoids automatic exercise (a long call ending in the money would otherwise buy 100 shares, tens of thousands of US dollars of SPY) and pin risk on the short leg.
 - **Early assignment:** if the short leg of a debit spread is assigned, the account briefly holds stock. The long leg still caps the loss, but the stock position uses borrowed money until it's closed. The exit manager checks for stock **first** on every run and at start-up, and closes the stock and the remaining leg straight away. Assignment is more likely on short calls just before SPY/QQQ ex-dividend dates, so the guard won't open a call spread whose short leg is in the money or near it when an ex-dividend date falls before expiry.
 - **The one remaining edge case:** if the PC is off for **2 or more trading days** at the wrong moment, an assignment or expiry could leave stock bought with borrowed money until Sebastian or IBKR closes it. IBKR automatically liquidates positions in accounts with a margin shortfall. The heartbeat alert (§6) exists so this is noticed within hours.
 
