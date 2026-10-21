@@ -131,7 +131,7 @@ It runs every 15 minutes in regular hours, and once at start-up. Rules, first ma
 
 Exits are valued at the unfavourable side of each quote (bid for longs, ask for shorts), not mid. Closing orders go through the same guard (the "closing orders" gate) and the same executor.
 
-*All thresholds are proposed defaults, to be tuned using paper results.*
+*Sebastian accepted these defaults on 2026-10-21. They can be changed at any time (§5.7).*
 
 ### 5.6 No debt: how it's enforced
 
@@ -142,6 +142,32 @@ Sebastian's rule: **never lose more than what was put in, and never owe IBKR mon
 - **No expiry risk:** entries at 3+ DTE, everything closed at 2 DTE. This avoids automatic exercise (a long call ending in the money would otherwise buy 100 shares, tens of thousands of US dollars of SPY) and pin risk on the short leg.
 - **Early assignment:** if the short leg of a debit spread is assigned, the account briefly holds stock. The long leg still caps the loss, but the stock position uses borrowed money until it's closed. The exit manager checks for stock **first** on every run and at start-up, and closes the stock and the remaining leg straight away. Assignment is more likely on short calls just before SPY/QQQ ex-dividend dates, so the guard won't open a call spread whose short leg is in the money or near it when an ex-dividend date falls before expiry.
 - **The one remaining edge case:** if the PC is off for **2 or more trading days** at the wrong moment, an assignment or expiry could leave stock bought with borrowed money until Sebastian or IBKR closes it. IBKR automatically liquidates positions in accounts with a margin shortfall. The heartbeat alert (§6) exists so this is noticed within hours.
+
+### 5.7 Changing the settings
+
+Every number in this plan lives in one settings file, **`data/settings.toml`**, with comments explaining each one. Sebastian can change them at any time, with no code changes and no restart:
+
+- **What's in the file:**
+  - capital in A$
+  - risk per trade
+  - max open positions, trades per day
+  - drawdown kill switch, losing-streak pause
+  - DTE range, deltas, spread widths
+  - stop, profit target, time stop
+  - minimum Claude confidence, model
+  - entry/exit timing
+  - go-live criteria
+- **Edit it, save it, done.** The bot re-reads the file at the start of every loop, so changes apply within about 15 minutes. The bot sends a phone notification listing what changed.
+- **Mistakes are safe.** If the file has a typo or an out-of-range value (for example risk per trade above 50%, or min DTE below 3), the bot rejects the whole edit, keeps the previous settings, and sends a phone notification saying what's wrong.
+- **Changes apply to new trades only.** Open positions keep the exit rules they were opened with, unless a tighter stop is set.
+- **Some rules are not settings** and can't be turned off from the file:
+  - debit/long only, no naked shorts
+  - no borrowing (USD cash ≥ 0)
+  - close by 2 DTE
+  - limit orders only
+  - paper-only unless both live flags are set
+- **Kill switch:** when it trips, it stays off until reset with `main.py --reset-kill-switch`. Editing the file doesn't reset it.
+- Every settings change is recorded in the journal with a timestamp.
 
 ## 6. Journal, alerts and tax
 
@@ -215,7 +241,7 @@ Researched on 2026-10-21. **It most likely doesn't limit this account, but the b
 2. **Exit replay tests:** recorded price paths, including an assignment case, run through `exit manager` → expected actions.
 3. **Dry-run mode:** the full loop against paper Gateway data, where the executor logs and doesn't send.
 4. **Paper trading for 4–8 weeks.**
-5. **Go-live criteria** *(proposed; Sebastian to confirm the numbers before paper trading starts):*
+5. **Go-live criteria** *(defaults accepted 2026-10-21, changeable in §5.7's settings file):*
    - at least **40 closed trades**
    - max drawdown **≤ 25%** of `capital_usd`
    - net P&L after commissions **> 0**, with the paper-fill haircut applied: subtract US$0.02 per leg per fill, because IBKR paper fills combos too generously
@@ -239,13 +265,7 @@ Each phase is its own PR, with tests.
 ## 11. Open items for Sebastian
 
 1. **Approve this plan,** or say what to change.
-2. **Confirm the default numbers:**
-   - 15% risk per trade
-   - 3 open positions
-   - 2 trades a day
-   - 30% drawdown kill switch
-   - the exit thresholds in §5.5
-   - the go-live criteria in §9
+2. ~~Confirm the default numbers~~ Done: defaults accepted on 2026-10-21, changeable at any time (§5.7).
 3. **Phase 0 (your side):**
    - IBKR account with options and spread permissions
    - paper account login
