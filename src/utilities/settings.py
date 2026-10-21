@@ -22,6 +22,10 @@ class Settings(BaseSettings):
   ib_gateway_port: int = 4002
   ib_client_id: int | None = None
 
+  # Live trading needs BOTH: ALLOW_LIVE=true and LIVE_CONFIRM=<the live account id>.
+  allow_live: bool = False
+  live_confirm: str | None = None
+
   # Optional FMP quotes/economic calendar API (MCP CLI only)
   quotes_api_key: str | None = None
 

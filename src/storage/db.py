@@ -39,6 +39,22 @@ MIGRATIONS = [
   );
   CREATE INDEX price_survey_run_at ON price_survey (run_at);
   """,
+  """
+  CREATE TABLE kill_switch (
+    id INTEGER PRIMARY KEY,
+    tripped_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    reset_at TEXT
+  );
+  CREATE TABLE guard_decisions (
+    id INTEGER PRIMARY KEY,
+    decided_at TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    approved INTEGER NOT NULL,
+    intent_json TEXT NOT NULL,
+    results_json TEXT NOT NULL
+  );
+  """,
 ]
 
 def connect(path: Path) -> sqlite3.Connection:

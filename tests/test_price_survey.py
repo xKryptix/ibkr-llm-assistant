@@ -19,7 +19,7 @@ def test_build_candidates_per_expiry_and_right() -> None:
 def test_save_and_summarize(tmp_path: Path) -> None:
   """Rows land in SQLite; summary counts what fits the cap."""
   conn = connect(tmp_path / "bot.sqlite")
-  assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+  assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
   candidates = build_candidates(CALLS, TODAY, StrategySettings())
   save(conn, dt.datetime(2026, 10, 21, tzinfo=dt.UTC).isoformat(), live_data=True,
        audusd=0.65, cap_usd=100.0, spots={"SPY": 602.5}, candidates=candidates)
@@ -37,4 +37,4 @@ def test_migrations_are_idempotent(tmp_path: Path) -> None:
   """Reconnecting does not re-run migrations."""
   connect(tmp_path / "bot.sqlite").close()
   conn = connect(tmp_path / "bot.sqlite")
-  assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+  assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
