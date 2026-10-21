@@ -16,7 +16,8 @@
 | Capital | **A$500**, converted to USD (see §4) |
 | Mode | IBKR **paper** account first, then a small live account only after the go-live criteria in §9 are met |
 | Where it runs | **Sebastian's Linux PC** for now. Plain Docker Compose, so it can move to TrueNAS later without changes. |
-| Interaction | Hands-off. Phone notifications only. No per-trade approval. |
+| Interaction | **Fully automated.** No per-trade approval. Phone notifications only. Sebastian's only ongoing jobs: keep the PC on, and reset the kill switch if it trips. |
+| Earlier `optbot/` code | Not available, so everything is written fresh using the designs in §3. |
 
 ## 2. What we keep, change and drop from the base repo
 
@@ -45,7 +46,6 @@ Licences were checked on 2026-10-21. Copied files keep their original notices. R
 | `csingley/ibflex` | MIT | Parse IBKR Flex reports for nightly reconciliation and the tax export. |
 | `chrisudf/ibkr-tax-report` | MIT | Starting point for the ATO CGT export (FIFO, RBA FX). |
 | `matthewchung74/alpaca-gatekeeper` | **none** | Design reference only: pure-function gates that all run, the exit priority order, and pricing exits at the unfavourable side of the quote. |
-| `optbot/` (Sebastian's earlier code) | own | `risk.py`, `exits.py`, `journal.py`, `bs.py`, `brain.py`, `ibkr.py`. **The zip isn't attached yet.** |
 
 Not used: `lumibot` (GPL), `optopsy` (AGPL; may be used later as a separate offline backtester, never imported), `kelvingao/ibkr-mcp` (proprietary), `extrange/ibkr-docker` (no licence).
 
@@ -102,7 +102,8 @@ Every gate is a pure function that returns pass or fail plus a reason. **All gat
 | Max loss per trade | ≤ `risk_per_trade_pct × capital_usd` (default 15%) |
 | Book budget | Open max loss plus the new order ≤ `capital_usd` minus realised losses |
 | Max open positions | Default 3 |
-| Max new trades per day | Default 2 *(see PDT, §8)* |
+| Max new trades per day | Default 2 |
+| Day trades | If IBKR reports a day-trade limit, same-day closes are allowed only for stop, assignment or ≤1 DTE, with 1 day trade kept in reserve (§8) |
 | Cash | USD cash after the order ≥ 0. The `whatIfOrder` preview has no warnings. |
 | Duplicates | No identical open order or same-direction position on the same expiry |
 | Market hours | Inside regular hours from `liquidHours`. No entries in the first 15 or last 30 minutes. |
@@ -169,14 +170,29 @@ Exits are valued at the unfavourable side of each quote (bid for longs, ask for 
   - Mitigations:
     - Entries need DTE ≥ 2.
     - The exit manager runs first on start-up.
-    - At entry, the bot places a **resting GTC take-profit limit order** on the combo, held by IBKR, so profits can be taken while the PC is down. The exit manager cancels it, and confirms the cancel, before sending any other close for that position.
+    - From the session after entry, the bot keeps a **resting GTC take-profit limit order** on the combo, held by IBKR, so profits can be taken while the PC is down. The exit manager cancels it, and confirms the cancel, before sending any other close for that position.
     - The heartbeat alert tells Sebastian to start the PC again.
 - **IBC (Gateway auto-login) was archived in September 2026.** The gnzsnz image still bundles it, and it works for paper today. If a future Gateway version breaks it, the planned replacement is `ibg-controller` (MIT). Pin the Gateway image version and don't auto-update it.
 - **Secrets** live in `.env`, which is git-ignored: IBKR paper login, Anthropic key, ntfy topic.
 
 ## 8. Pattern-day-trader (PDT) rule
 
-*Being researched. This section will be filled in before approval.*
+Researched on 2026-10-21. **It most likely doesn't limit this account, but the bot is built to be safe either way.**
+
+- **FINRA has replaced PDT.** The SEC approved the change on 14 April 2026 ([FINRA Notice 26-10](https://www.finra.org/rules-guidance/notices/26-10)), and it took effect on **4 June 2026**.
+  - The 4-day-trades-in-5-days rule and the US$25k minimum are gone. They're replaced by *intraday margin* rules: an account that repeatedly fails to cover intraday margin deficits can be restricted for 90 days.
+  - Brokers may keep applying the old PDT rules until **20 October 2027**.
+- **IBKR has said** that non-US residents whose accounts are carried by IBKR Australia are not subject to PDT ([IBKR on X, Feb 2025](https://x.com/IBKR/status/1889449440223584524)). That's a social-media post, not a formal policy page.
+- **Not confirmed:**
+  - whether a same-day vertical counts as one day trade or two at IBKR
+  - whether an Australian *cash* account can trade verticals at all
+  - So the plan stays with a margin account (needed for spreads). The guard still requires USD cash ≥ 0, so the bot never borrows, and an intraday margin deficit shouldn't arise from debit trades.
+
+**Built into the bot regardless:**
+- The guard reads IBKR's `DayTradesRemaining` account value. If IBKR reports a limit, the bot only closes a position on the day it opened it for a stop, assignment or ≤1 DTE. It keeps 1 day trade in reserve for those.
+- The resting take-profit order (§7) is placed from the **next** session onward, so it can't create a same-day round trip.
+- Max 2 new trades a day. Holding periods are measured in days (§5.5), not minutes.
+- **Sebastian:** once the account is open, check the "Day Trades Left" field in Client Portal, or ask IBKR Australia support.
 
 ## 9. Testing and go-live
 
@@ -200,7 +216,7 @@ Exits are valued at the unfavourable side of each quote (bid for longs, ask for 
 
 | Phase | Deliverables |
 |---|---|
-| **1. Modernise** | Settings made optional, new model default, Postgres and web UI removed, SQLite added. Compose switched to gnzsnz in paper mode. Read-only MCP CLI. **Price-survey script.** Tests and ruff pass. |
+| **1. Modernise** | Settings made optional, new model default, Postgres and web UI removed, SQLite added. Compose switched to gnzsnz in paper mode. Read-only MCP CLI. **Price-survey script.** Replace the inherited `docker-publish.yml`, which pushes to the original author's registry, with a PR workflow that runs ruff and pytest. Tests and ruff pass. |
 | **2. Risk guard** | `guard/` package with every §5.3 gate, the kill switch, the `HALT` file and the paper/live check. Adversarial unit tests. |
 | **3. Strategy and execution** | Snapshot, brain (forced tool), builder, executor (preview, reprice ladder, reconcile), exit manager with assignment handling, scheduler. Dry-run mode. |
 | **4. Journal and alerts** | SQLite journal, ntfy alerts, heartbeat, daily summary, tax CSV with RBA rates. |
@@ -212,15 +228,14 @@ Each phase is its own PR, with tests.
 ## 11. Open items for Sebastian
 
 1. **Approve this plan,** or say what to change.
-2. **Attach `optbot/`** if you want its modules reused. Otherwise Phases 2–4 are written fresh using the borrowed designs above.
-3. **Confirm the default numbers:**
+2. **Confirm the default numbers:**
    - 15% risk per trade
    - 3 open positions
    - 2 trades a day
    - 30% drawdown kill switch
    - the exit thresholds in §5.5
    - the go-live criteria in §9
-4. **Phase 0 (your side):**
+3. **Phase 0 (your side):**
    - IBKR account with options and spread permissions
    - paper account login
    - OPRA and US stock market data subscriptions (these apply to paper too)
